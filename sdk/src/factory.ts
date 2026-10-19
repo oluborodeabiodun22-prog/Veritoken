@@ -122,11 +122,18 @@ export function createClients(config: CreateClientsConfig): Partial<ClientMap> {
   for (const key of Object.keys(CTORS) as ClientKey[]) {
     const override = config.overrides?.[key];
     if (override) {
+      const overrideId = (override as { contractId?: unknown }).contractId;
+      if (typeof overrideId === "string" && overrideId.trim() === "") {
+        throw new Error(`overrides.${key} has a blank contractId — supply a valid contract ID or omit the override.`);
+      }
       (clients as Record<ClientKey, unknown>)[key] = override;
       continue;
     }
     const contractId = config.contractIds[key];
-    if (!contractId) continue;
+    if (contractId === undefined) continue;
+    if (contractId.trim() === "") {
+      throw new Error(`contractIds.${key} is blank — supply a valid contract ID or omit the key.`);
+    }
     const Ctor = CTORS[key];
     (clients as Record<ClientKey, unknown>)[key] = new Ctor(contractId, server, networkPassphrase);
   }
@@ -143,6 +150,24 @@ export class ClientFactory {
   private readonly clients: Partial<ClientMap>;
 
   constructor(config: CreateClientsConfig) {
+    const { contractIds, overrides } = config ?? ({} as CreateClientsConfig);
+    if (typeof contractIds !== "object" || contractIds === null || Array.isArray(contractIds)) {
+      throw new Error("ClientFactory: config.contractIds must be an object keyed by client name.");
+    }
+    for (const [key, id] of Object.entries(contractIds)) {
+      if (!(key in CTORS)) {
+        throw new Error(`ClientFactory: unknown client "${key}" in contractIds.`);
+      }
+      if (typeof id !== "string" || id.trim() === "") {
+        throw new Error(`ClientFactory: contractIds.${key} must be a non-empty contract ID string.`);
+      }
+    }
+    const overrideCount = Object.values(overrides ?? {}).filter(Boolean).length;
+    if (Object.keys(contractIds).length === 0 && overrideCount === 0) {
+      throw new Error(
+        "ClientFactory: no clients configured — provide at least one entry in contractIds or overrides.",
+      );
+    }
     this.clients = createClients(config);
   }
 

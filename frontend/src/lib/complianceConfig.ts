@@ -57,11 +57,13 @@ export function exportConfig(
   riskConfig: RiskConfig | null,
   opts: { label?: string; network?: string } = {},
 ): ComplianceConfigExport {
+  const label = opts.label?.trim() || "Compliance config";
+  const network = opts.network?.trim() || "unknown";
   return {
     version: EXPORT_FORMAT_VERSION,
     exportedAt: new Date().toISOString(),
-    label: opts.label ?? "Compliance config",
-    network: opts.network ?? "unknown",
+    label,
+    network,
     rules: {
       max_transfer_amount: String(rules.max_transfer_amount),
       min_holding_period: String(rules.min_holding_period),
@@ -109,7 +111,12 @@ export type ImportResult =
   | { ok: true; config: ComplianceConfigExport }
   | { ok: false; error: string };
 
-export function parseConfigJson(json: string): ImportResult {
+export interface ParseConfigOptions {
+  /** Reject imports whose tierPolicies list is empty. */
+  requireTierPolicies?: boolean;
+}
+
+export function parseConfigJson(json: string, opts: ParseConfigOptions = {}): ImportResult {
   let raw: unknown;
   try {
     raw = JSON.parse(json);
@@ -138,6 +145,16 @@ export function parseConfigJson(json: string): ImportResult {
   if (!Array.isArray(obj.tierPolicies)) {
     return { ok: false, error: 'Missing or invalid "tierPolicies" field.' };
   }
+  if (opts.requireTierPolicies && obj.tierPolicies.length === 0) {
+    return { ok: false, error: '"tierPolicies" must contain at least one policy.' };
+  }
+  if (
+    typeof obj.riskConfig === "object" &&
+    obj.riskConfig !== null &&
+    Object.keys(obj.riskConfig).length === 0
+  ) {
+    return { ok: false, error: '"riskConfig" must be null or a non-empty object.' };
+  }
 
   const rules = obj.rules as Record<string, unknown>;
   const requiredRuleKeys: Array<keyof ComplianceConfigExport["rules"]> = [
@@ -155,12 +172,47 @@ export function parseConfigJson(json: string): ImportResult {
     }
   }
 
+  for (let i = 0; i < obj.tierPolicies.length; i++) {
+    const error = tierPolicyEntryError(obj.tierPolicies[i], i);
+    if (error) {
+      return { ok: false, error };
+    }
+  }
+
   return { ok: true, config: raw as ComplianceConfigExport };
+}
+
+/** Returns a reason the entry is structurally malformed, or null if it is well-formed. */
+function tierPolicyEntryError(entry: unknown, i: number): string | null {
+  const prefix = `Invalid tierPolicies[${i}]`;
+  if (typeof entry !== "object" || entry === null) return `${prefix}: expected an object.`;
+  const e = entry as Record<string, unknown>;
+  if (!Number.isInteger(e.fromTier)) return `${prefix}: "fromTier" must be an integer.`;
+  if (!Number.isInteger(e.toTier)) return `${prefix}: "toTier" must be an integer.`;
+  if (typeof e.policy !== "object" || e.policy === null) return `${prefix}.policy is missing or not a valid policy object.`;
+  const p = e.policy as Record<string, unknown>;
+  if (typeof p.blocked !== "boolean") return `${prefix}: "policy.blocked" must be a boolean.`;
+  if (typeof p.max_transfer_amount !== "string" || !/^-?\d+$/.test(p.max_transfer_amount)) {
+    return `${prefix}: "policy.max_transfer_amount" must be a decimal string.`;
+  }
+  if (!Number.isInteger(p.min_from_tier)) return `${prefix}: "policy.min_from_tier" must be an integer.`;
+  if (!Number.isInteger(p.min_to_tier)) return `${prefix}: "policy.min_to_tier" must be an integer.`;
+  return null;
 }
 
 /** Convert a parsed export back to typed domain objects ready for the UI. */
 export function configToRules(config: ComplianceConfigExport): ComplianceRules {
   const r = config.rules;
+  const decimalFields = [
+    ["max_transfer_amount", r.max_transfer_amount],
+    ["min_holding_period", r.min_holding_period],
+    ["max_holding_period", r.max_holding_period],
+  ] as const;
+  for (const [field, value] of decimalFields) {
+    if (typeof value !== "string" || !/^\d+$/.test(value)) {
+      throw new Error(`Invalid rules field "${field}": expected a non-negative decimal string.`);
+    }
+  }
   return {
     max_transfer_amount: BigInt(r.max_transfer_amount),
     min_holding_period: BigInt(r.min_holding_period),

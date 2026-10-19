@@ -47,6 +47,17 @@ describe("createClients", () => {
     expect(clients.rwaToken).toBe(fakeRwa);
   });
 
+  it("rejects blank contract IDs in contractIds and overrides", () => {
+    const server = mockServer();
+    expect(() => createClients({ server, contractIds: { kycRegistry: "   " } })).toThrow(
+      /contractIds\.kycRegistry is blank/,
+    );
+    const blankOverride = { contractId: "" } as unknown as RwaTokenClient;
+    expect(() => createClients({ server, contractIds: {}, overrides: { rwaToken: blankOverride } })).toThrow(
+      /overrides\.rwaToken has a blank contractId/,
+    );
+  });
+
   it("respects an explicit networkPassphrase override", () => {
     const server = mockServer();
     const clients = createClients({
@@ -73,6 +84,18 @@ describe("ClientFactory", () => {
     const factory = new ClientFactory({ server: mockServer(), contractIds: { kycRegistry: KYC_ID } });
     expect(factory.has("kycRegistry")).toBe(true);
     expect(factory.has("rwaToken")).toBe(false);
+  });
+
+  it("constructor rejects an empty or malformed config up front", () => {
+    const server = mockServer();
+    expect(() => new ClientFactory({ server, contractIds: {} })).toThrow(/no clients configured/);
+    expect(() => new ClientFactory({ server, contractIds: [] as unknown as {} })).toThrow(/must be an object/);
+    expect(() => new ClientFactory({ server, contractIds: { kycRegistry: "  " } })).toThrow(
+      /contractIds\.kycRegistry must be a non-empty/,
+    );
+    expect(
+      () => new ClientFactory({ server, contractIds: { bogus: KYC_ID } as unknown as { kycRegistry: string } }),
+    ).toThrow(/unknown client "bogus"/);
   });
 
   it("get() returns an injected override", () => {

@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{InvoiceMeta, InvoiceStatus, InvoiceToken, InvoiceTokenClient};
+use crate::{InvoiceError, InvoiceMeta, InvoiceStatus, InvoiceToken, InvoiceTokenClient};
 use compliance_engine::{ComplianceEngine, ComplianceEngineClient, ComplianceRules};
 use kyc_registry::{KycRegistry, KycRegistryClient};
 use soroban_sdk::{
@@ -147,6 +147,39 @@ fn test_transfer_before_due_date() {
     h.token.transfer(&inv_id(&h.env), &alice, &bob, &400);
     assert_eq!(h.token.balance(&alice, &inv_id(&h.env)), 600);
     assert_eq!(h.token.balance(&bob, &inv_id(&h.env)), 400);
+}
+
+#[test]
+fn test_transfer_rejects_blank_kyc_reference() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    let bob = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.approve_kyc(&bob);
+    h.token.issue(&inv_id(&h.env), &alice, &1_000);
+
+    assert_eq!(
+        h.token
+            .try_transfer(&String::from_str(&h.env, "   "), &alice, &bob, &100),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+}
+
+#[test]
+fn test_evaluate_transfer_kyc_rejects_unapproved_recipient() {
+    let h = setup();
+    let alice = Address::generate(&h.env);
+    h.approve_kyc(&alice);
+    h.token.issue(&inv_id(&h.env), &alice, &1_000);
+
+    // carol has no KYC record — the fail-fast guard in evaluate_transfer_kyc
+    // must reject the missing KYC reference before the compliance engine runs.
+    let carol = Address::generate(&h.env);
+    assert_eq!(
+        h.token
+            .try_transfer(&inv_id(&h.env), &alice, &carol, &100),
+        Err(Ok(InvoiceError::KycNotApproved.into()))
+    );
 }
 
 #[test]
@@ -596,6 +629,26 @@ fn test_webhook_http_is_rejected() {
 }
 
 #[test]
+fn test_create_invoice_rejects_transfer_fee_above_100_percent() {
+    use crate::InvoiceError;
+    use soroban_sdk::Error;
+    let h = setup();
+
+    let mut m = h.make_invoice("INV-FEE-MAX");
+    m.transfer_fee_bps = 10_000;
+    h.token.create_invoice(&m);
+
+    let mut bad = h.make_invoice("INV-FEE-BAD");
+    bad.transfer_fee_bps = 10_001;
+    let res = h.token.try_create_invoice(&bad);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(InvoiceError::InvalidMetadata)
+    );
+    assert!(h.token.try_get_meta(&bad.invoice_id).is_err());
+}
+
+#[test]
 fn test_webhook_non_url_is_rejected() {
     let h = setup();
     let mut m = h.make_invoice("INV-WEBHOOK-4");
@@ -953,8 +1006,29 @@ fn test_journal_records_created_to_issued() {
     h.token.issue(&inv_id(&h.env), &holder, &1_000);
     let journal = h.token.get_journal(&inv_id(&h.env));
     assert_eq!(journal.len(), 1);
+    assert_eq!(
+        journal.get(0).unwrap().event_tag,
+        String::from_str(&h.env, "issued")
+    );
     assert_eq!(journal.get(0).unwrap().from_status, InvoiceStatus::Created);
     assert_eq!(journal.get(0).unwrap().to_status, InvoiceStatus::Issued);
+}
+
+#[test]
+fn test_journal_event_tags_are_non_empty() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+
+    h.token.issue(&inv_id(&h.env), &holder, &1_000);
+    h.token.partial_settle(&inv_id(&h.env), &500_000_000_000);
+    h.token.settle(&inv_id(&h.env));
+    h.token.redeem(&inv_id(&h.env), &holder, &1_000);
+
+    let journal = h.token.get_journal(&inv_id(&h.env));
+    for i in 0..journal.len() {
+        assert!(!journal.get(i).unwrap().event_tag.is_empty());
+    }
 }
 
 #[test]
@@ -1103,6 +1177,78 @@ fn test_update_meta_webhook_validated_on_update() {
     let mut m = h.token.get_meta(&inv_id(&h.env));
     m.notification_webhook = String::from_str(&h.env, "ftp://bad-scheme.example.com");
     assert!(h.token.try_update_meta(&inv_id(&h.env), &m).is_err());
+}
+
+#[test]
+fn test_set_webhook_empty_clears_webhook() {
+    let h = setup();
+    let id = inv_id(&h.env);
+    h.token
+        .set_webhook(&id, &String::from_str(&h.env, "https://example.com/hook"));
+    assert_eq!(
+        h.token.get_meta(&id).notification_webhook,
+        String::from_str(&h.env, "https://example.com/hook")
+    );
+    // Blank value is an explicit clear, not an ambiguous stored value.
+    h.token.set_webhook(&id, &String::from_str(&h.env, ""));
+    assert_eq!(
+        h.token.get_meta(&id).notification_webhook,
+        String::from_str(&h.env, "")
+    );
+    // Whitespace-only is not a blank clear and is rejected without touching state.
+    assert_eq!(
+        h.token
+            .try_set_webhook(&id, &String::from_str(&h.env, "   ")),
+        Err(Ok(InvoiceError::InvalidWebhook.into()))
+    );
+    assert!(h.token.get_meta(&id).notification_webhook.is_empty());
+}
+
+#[test]
+fn test_duplicate_invoice_id_rejected_before_state_write() {
+    let h = setup();
+    let mut dup = meta(&h.env);
+    dup.face_value_usd = 1;
+    assert_eq!(
+        h.token.try_create_invoice(&dup),
+        Err(Ok(InvoiceError::InvoiceAlreadyExists.into()))
+    );
+    // Original metadata and the invoice list are untouched.
+    assert_eq!(
+        h.token.get_meta(&inv_id(&h.env)).face_value_usd,
+        1_000_000_000_000
+    );
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 1);
+}
+
+#[test]
+fn test_create_invoice_rejects_out_of_range_discount_rate() {
+    let h = setup();
+    let mut m = h.make_invoice("INV-DISC-MAX");
+    m.discount_rate_bps = 10_000;
+    h.token.create_invoice(&m);
+
+    let mut bad = h.make_invoice("INV-DISC-BAD");
+    bad.discount_rate_bps = 10_001;
+    assert_eq!(
+        h.token.try_create_invoice(&bad),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 2);
+}
+
+#[test]
+fn test_create_invoice_rejects_non_positive_face_value() {
+    let h = setup();
+    for (id, fv) in [("INV-FV-ZERO", 0i128), ("INV-FV-NEG", -1i128)] {
+        let mut m = h.make_invoice(id);
+        m.face_value_usd = fv;
+        assert_eq!(
+            h.token.try_create_invoice(&m),
+            Err(Ok(InvoiceError::InvalidMetadata.into()))
+        );
+    }
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 1);
 }
 
 // ── Lifecycle pause tests ─────────────────────────────────────────────────────
@@ -1395,6 +1541,8 @@ fn test_set_fee_recipient_rejects_blocklisted_addr() {
     let h = setup();
     let bad_addr = Address::generate(&h.env);
     h.approve_kyc(&bad_addr);
+    h.token
+        .create_invoice(&make_fee_invoice(&h.env, "FEE-ROLE-BLOCK", None));
     h.compliance.add_to_blocklist(&bad_addr);
 
     // set_fee_recipient must reject a blocklisted address.
@@ -1414,7 +1562,46 @@ fn test_set_fee_recipient_stores_valid_addr() {
     let h = setup();
     let addr = Address::generate(&h.env);
     h.approve_kyc(&addr);
+    h.token
+        .create_invoice(&make_fee_invoice(&h.env, "FEE-ROLE-OK", None));
 
+    h.token.set_fee_recipient(&addr);
+    assert_eq!(h.token.get_fee_recipient_role(), Some(addr));
+}
+
+#[test]
+fn test_set_fee_recipient_rejects_zero_fee_schedule() {
+    let h = setup();
+    let addr = Address::generate(&h.env);
+    h.approve_kyc(&addr);
+
+    assert_eq!(
+        h.token.try_set_fee_recipient(&addr),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+    assert_eq!(h.token.get_fee_recipient_role(), None);
+}
+
+// Fix — set_fee_recipient: reject zero transfer fee (#850)
+// Before the guard, set_fee_recipient could be called even when every invoice
+// has transfer_fee_bps == 0, storing a role address that would never receive
+// fees.  The fix checks has_positive_transfer_fee before any state is written.
+#[test]
+fn test_set_fee_recipient_rejected_when_all_invoices_have_zero_fee() {
+    let h = setup();
+    let addr = Address::generate(&h.env);
+    h.approve_kyc(&addr);
+
+    // Default setup has one invoice with transfer_fee_bps = 0 — must be rejected.
+    assert_eq!(
+        h.token.try_set_fee_recipient(&addr),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+    assert_eq!(h.token.get_fee_recipient_role(), None);
+
+    // After adding an invoice with a positive fee, the call must succeed.
+    h.token
+        .create_invoice(&make_fee_invoice(&h.env, "FEE-ENABLE-850", None));
     h.token.set_fee_recipient(&addr);
     assert_eq!(h.token.get_fee_recipient_role(), Some(addr));
 }
@@ -1747,4 +1934,162 @@ fn test_batch_settle_capped_at_10() {
     let results = h.token.batch_settle(&settlements);
     // Only 10 should be processed.
     assert_eq!(results.len(), 10);
+}
+
+// ── Regression tests: validation guards (get_invoices_page, settle, redeem, create_invoice) ─────
+
+/// get_invoices_page: page_size = 0 must be rejected before any list read.
+#[test]
+fn test_get_invoices_page_zero_page_size_rejected() {
+    let h = setup();
+    // page_size = 0 is invalid and must panic before touching the list.
+    assert!(
+        h.token.try_get_invoices_page(&0, &0).is_err(),
+        "page_size=0 must be rejected"
+    );
+}
+
+/// get_invoices_page: page_size > 50 must be rejected before any list read.
+#[test]
+fn test_get_invoices_page_oversized_page_size_rejected() {
+    let h = setup();
+    // page_size = 51 exceeds the hard cap of 50.
+    assert!(
+        h.token.try_get_invoices_page(&0, &51).is_err(),
+        "page_size=51 must be rejected"
+    );
+}
+
+/// get_invoices_page: valid page_size (1–50) returns the correct slice.
+#[test]
+fn test_get_invoices_page_valid_returns_correct_slice() {
+    let h = setup();
+    h.token.create_invoice(&h.make_invoice("PG-002"));
+    h.token.create_invoice(&h.make_invoice("PG-003"));
+
+    // 3 invoices total; page 0, size 2 → first 2.
+    let page0 = h.token.get_invoices_page(&0, &2);
+    assert_eq!(page0.len(), 2);
+
+    // page 1, size 2 → last 1.
+    let page1 = h.token.get_invoices_page(&1, &2);
+    assert_eq!(page1.len(), 1);
+
+    // page 2 is past the end → empty.
+    let page2 = h.token.get_invoices_page(&2, &2);
+    assert_eq!(page2.len(), 0);
+
+    // page_size = 50 (max allowed) must not be rejected.
+    let big = h.token.get_invoices_page(&0, &50);
+    assert_eq!(big.len(), 3);
+}
+
+/// settle: the normal path (face_value_usd > 0) must still succeed after the guard.
+#[test]
+fn test_settle_normal_path_unchanged() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&inv_id(&h.env), &holder, &100);
+
+    // Normal settle must succeed.
+    h.token.settle(&inv_id(&h.env));
+    assert!(h.token.is_settled(&inv_id(&h.env)));
+    // settlement_amount must equal face_value_usd.
+    assert_eq!(
+        h.token.settlement_amount(&inv_id(&h.env)),
+        1_000_000_000_000i128
+    );
+}
+
+/// redeem: amount = 0 must be rejected before any balance read or write.
+#[test]
+fn test_redeem_zero_amount_rejected() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&inv_id(&h.env), &holder, &1_000);
+    h.token.settle(&inv_id(&h.env));
+
+    // Zero-amount redeem must fail before any state mutation.
+    assert!(
+        h.token.try_redeem(&inv_id(&h.env), &holder, &0).is_err(),
+        "redeem(0) must be rejected"
+    );
+
+    // Balance and supply must be unchanged.
+    assert_eq!(h.token.balance(&holder, &inv_id(&h.env)), 1_000);
+    assert_eq!(h.token.total_supply(&inv_id(&h.env)), 1_000);
+}
+
+/// redeem: negative amount must also be rejected.
+#[test]
+fn test_redeem_negative_amount_rejected() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&inv_id(&h.env), &holder, &1_000);
+    h.token.settle(&inv_id(&h.env));
+
+    assert!(
+        h.token.try_redeem(&inv_id(&h.env), &holder, &-1).is_err(),
+        "redeem(-1) must be rejected"
+    );
+}
+
+/// create_invoice: empty invoice_id must be rejected before any storage write.
+#[test]
+fn test_create_invoice_empty_id_rejected() {
+    let h = setup();
+    let mut bad_meta = h.make_invoice("PLACEHOLDER");
+    // Override invoice_id with an empty string.
+    bad_meta.invoice_id = String::from_str(&h.env, "");
+
+    assert!(
+        h.token.try_create_invoice(&bad_meta).is_err(),
+        "empty invoice_id must be rejected"
+    );
+
+    // The invoices list must still contain exactly the one invoice from setup().
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 1);
+}
+
+/// create_invoice: non-empty invoice_id is accepted (normal path unchanged).
+#[test]
+fn test_create_invoice_non_empty_id_accepted() {
+    let h = setup();
+    h.token.create_invoice(&h.make_invoice("VALID-ID"));
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 2);
+}
+
+// Fix #847 — append_journal_entry: reject empty event tags
+// Before the fix, there was no public append_journal_entry entry point.
+// A journal entry recorded without a meaningful tag would make the lifecycle
+// audit log harder to inspect and would reduce confidence in the audit record.
+// The new function requires a non-empty event_tag and panics with
+// EmptyEventTag before any state is written when the string is empty.
+#[test]
+fn test_append_journal_entry_rejects_empty_event_tag() {
+    use crate::InvoiceError;
+    use soroban_sdk::Error;
+
+    let h = setup();
+    let id = inv_id(&h.env);
+    let empty_tag = String::from_str(&h.env, "");
+
+    // An empty event tag must be rejected — journal length must not change.
+    let before_len = h.token.get_journal(&id).len();
+    assert_eq!(
+        h.token.try_append_journal_entry(&id, &empty_tag),
+        Err(Ok(Error::from(InvoiceError::EmptyEventTag)))
+    );
+    assert_eq!(h.token.get_journal(&id).len(), before_len);
+
+    // Normal path: a non-empty event tag must be accepted and appended.
+    let tag = String::from_str(&h.env, "compliance_review_passed");
+    h.token.append_journal_entry(&id, &tag);
+    let journal = h.token.get_journal(&id);
+    assert_eq!(journal.len(), before_len + 1);
+    let entry = journal.get(journal.len() - 1).expect("last entry");
+    assert_eq!(entry.event_tag, tag);
 }

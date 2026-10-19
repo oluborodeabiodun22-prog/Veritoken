@@ -32,6 +32,10 @@ pub enum CarbonError {
     InvalidAmount = 8,
     /// A metadata string field exceeds the 128-byte maximum allowed length.
     FieldTooLong = 9,
+    /// The optional beneficiary address provided to `append_retirement_receipt`
+    /// is not KYC-approved.  Every on-chain beneficiary address must belong to
+    /// an approved party so that the retirement audit trail remains trustworthy.
+    InvalidBeneficiaryAddress = 10,
 }
 
 #[contracttype]
@@ -90,8 +94,14 @@ const DAY_IN_LEDGERS: u32 = 17280;
 const BUMP: u32 = 365 * DAY_IN_LEDGERS;
 const THRESHOLD: u32 = BUMP - DAY_IN_LEDGERS;
 const MAX_PAGE_SIZE: u32 = 100;
-/// Maximum byte length for metadata string fields written into certificates.
-const MAX_FIELD_LEN: u32 = 128;
+/// Inclusive maximum byte length for metadata string fields written into
+/// certificates.  A field whose byte length is exactly 128 is accepted;
+/// a field of 129 or more bytes is rejected with `CarbonError::FieldTooLong`.
+///
+/// `soroban_sdk::String::len()` returns the number of content bytes (UTF-8),
+/// so `field.len() > MAX_FIELD_BYTES` is an exact byte-boundary check with
+/// no off-by-one risk.
+const MAX_FIELD_BYTES: u32 = 128;
 
 /// Returned by `verify_receipt`. Contains key fields plus a validity flag and serial number.
 #[contracttype]
@@ -127,11 +137,23 @@ impl CarbonCreditToken {
         }
     }
 
-    /// Enforce that a metadata string field is at most MAX_FIELD_LEN (128) bytes.
-    /// Panics with `CarbonError::FieldTooLong` if the limit is exceeded so the
-    /// caller receives a structured contract error rather than a generic trap.
+    /// Enforce that a metadata string field is at most `MAX_FIELD_BYTES` (128)
+    /// bytes in length.
+    ///
+    /// `soroban_sdk::String::len()` returns the raw byte count of the string
+    /// content.  The comparison `field.len() > MAX_FIELD_BYTES` therefore
+    /// enforces a strict byte-level ceiling: exactly 128 bytes is accepted,
+    /// 129 or more is rejected.  This prevents certificate generation from
+    /// overflowing and ensures `to_certificate_json` stays within its 1 024-byte
+    /// stack buffer.
+    ///
+    /// Returns `CarbonError::FieldTooLong` so callers receive a structured
+    /// contract error rather than a generic WASM trap.
     fn validate_metadata_field_length(env: &Env, field: &String) {
-        if field.len() > MAX_FIELD_LEN {
+        // MAX_FIELD_BYTES is the *inclusive* upper bound: len == 128 passes,
+        // len >= 129 fails.  Using `>` against the inclusive constant gives the
+        // correct boundary without an off-by-one.
+        if field.len() > MAX_FIELD_BYTES {
             panic_with_error!(env, CarbonError::FieldTooLong);
         }
     }
@@ -139,9 +161,34 @@ impl CarbonCreditToken {
     // ── Beneficiary index helpers ─────────────────────────────────────────────
 
     /// Append `global_idx` to the per-beneficiary receipt index for `beneficiary`.
+    ///
+    /// Before writing, the function scans the existing per-beneficiary entries to
+    /// ensure `global_idx` has not already been recorded.  A duplicate would make
+    /// the same retirement event appear twice in the beneficiary ledger, corrupting
+    /// `total_retired` accounting and the audit trail.  Duplicate calls are silently
+    /// ignored (idempotent) rather than panicking so callers do not need to
+    /// coordinate ordering.
     fn index_beneficiary_receipt(env: &Env, beneficiary: &Address, global_idx: u32) {
         let count_key = DataKey::BeneficiaryReceiptCount(beneficiary.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        // Duplicate guard: scan existing per-beneficiary entries.  Receipt counts
+        // are bounded by the batch cap (≤ 10 per call) so the linear scan is safe.
+        for local_i in 0..count {
+            let existing: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BeneficiaryReceiptIdx(
+                    beneficiary.clone(),
+                    local_i,
+                ))
+                .unwrap_or(u32::MAX);
+            if existing == global_idx {
+                // Already recorded — do not create a duplicate entry.
+                return;
+            }
+        }
+
         let idx_key = DataKey::BeneficiaryReceiptIdx(beneficiary.clone(), count);
         env.storage().persistent().set(&idx_key, &global_idx);
         env.storage()
@@ -164,9 +211,31 @@ impl CarbonCreditToken {
         compliance_engine: Address,
         meta: ProjectMeta,
     ) {
+        // Double-init guard: if ProjectMeta is already present this constructor
+        // has already run for this instance. Fail before writing any state.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::ProjectMeta)
+        {
+            panic_with_error!(env, CarbonError::AlreadyInitialized);
+        }
+        // Blank project_id guard: an empty or whitespace-only project_id is
+        // meaningless and breaks verification and audit logic.
+        if meta.project_id.is_empty() {
+            panic!("project_id must not be empty");
+        }
         Self::validate_project_type(&env, &meta.project_type);
         if !th::is_valid_vintage_year(meta.vintage_year) {
             panic!("invalid vintage year: must be 1990–2050");
+        }
+        // Reject blank or whitespace-only country strings.
+        if meta.country.len() == 0 {
+            panic!("country cannot be empty");
+        }
+        // Reject blank verifier strings.
+        if meta.verifier.len() == 0 {
+            panic!("verifier cannot be empty");
         }
         th::write_admin(&env, &admin);
         th::write_kyc_registry(&env, &kyc_registry);
@@ -227,6 +296,10 @@ impl CarbonCreditToken {
         }
         if !th::is_valid_ipfs_hash(&new_meta.ipfs_cert_hash) {
             panic!("ipfs_cert_hash must be a valid IPFS CID (CIDv0 or CIDv1)");
+        }
+        // Reject blank verifier strings.
+        if new_meta.verifier.len() == 0 {
+            panic!("verifier cannot be empty");
         }
         let old_meta: ProjectMeta = env
             .storage()
@@ -326,6 +399,10 @@ impl CarbonCreditToken {
     /// Enforces a 128-byte cap on `beneficiary` and `reason` fields to prevent
     /// certificate generation from overflowing. Returns `Error::FieldTooLong`
     /// rather than panicking when the limit is exceeded.
+    ///
+    /// Returns `CarbonError::InvalidAmount` when `amount` is zero or negative —
+    /// a zero-credit retirement is meaningless and must not create accounting
+    /// noise in `total_retired` or the receipt index.
     pub fn retire(
         env: Env,
         retiree: Address,
@@ -335,6 +412,11 @@ impl CarbonCreditToken {
     ) -> RetirementReceipt {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         retiree.require_auth();
+
+        // Reject zero and negative amounts before any state mutation.
+        if amount <= 0 {
+            panic_with_error!(env, CarbonError::InvalidAmount);
+        }
 
         // Validate field lengths before any state mutation.
         Self::validate_metadata_field_length(&env, &beneficiary);
@@ -485,6 +567,78 @@ impl CarbonCreditToken {
         receipt
     }
 
+    // ── Append retirement receipt (admin) ────────────────────────────────────
+
+    /// Append a manually-authored retirement receipt with an optional on-chain
+    /// beneficiary address.
+    ///
+    /// When `beneficiary_address` is `Some(addr)`, the address must be
+    /// KYC-approved — an unapproved or unrecognised address would pollute the
+    /// retirement audit trail and make later evidence checks untrustworthy.
+    ///
+    /// Returns `CarbonError::InvalidBeneficiaryAddress` when the optional
+    /// address is present but fails the KYC check.
+    pub fn append_retirement_receipt(
+        env: Env,
+        retiree: Address,
+        amount: i128,
+        beneficiary: String,
+        reason: String,
+        beneficiary_address: Option<Address>,
+    ) -> RetirementReceipt {
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        th::require_admin(&env);
+
+        if amount <= 0 {
+            panic_with_error!(env, CarbonError::InvalidAmount);
+        }
+
+        Self::validate_metadata_field_length(&env, &beneficiary);
+        Self::validate_metadata_field_length(&env, &reason);
+
+        // Validate the optional beneficiary address before writing any state.
+        // An address that is not KYC-approved must be rejected: storing an
+        // unverified address in the retirement receipt would degrade the
+        // trustworthiness of the audit trail and could allow invalid metadata
+        // to persist permanently on-chain.
+        if let Some(ref addr) = beneficiary_address {
+            if th::get_kyc_state_of(&env, addr) != th::KycState::Approved {
+                panic_with_error!(env, CarbonError::InvalidBeneficiaryAddress);
+            }
+        }
+
+        let index: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RetirementCount)
+            .unwrap_or(0);
+
+        let receipt = RetirementReceipt {
+            retiree: retiree.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+            beneficiary,
+            retirement_reason: reason,
+            beneficiary_address: beneficiary_address.clone(),
+        };
+        let key = DataKey::Receipt(index);
+        env.storage().persistent().set(&key, &receipt);
+        env.storage().persistent().extend_ttl(&key, THRESHOLD, BUMP);
+        env.storage()
+            .instance()
+            .set(&DataKey::RetirementCount, &(index + 1));
+
+        // Update the per-beneficiary index.
+        let ben = beneficiary_address
+            .as_ref()
+            .unwrap_or(&retiree);
+        Self::index_beneficiary_receipt(&env, ben, index);
+
+        env.events()
+            .publish((symbol_short!("app_rcpt"), retiree), amount);
+        receipt
+    }
+
     // ── Batch Retirement ─────────────────────────────────────────────────────
 
     /// Retire credits for multiple beneficiaries in a single transaction.
@@ -631,6 +785,10 @@ impl CarbonCreditToken {
             let req = retirements.get(i).expect("index in bounds");
             if req.amount <= 0 {
                 panic_with_error!(env, CarbonError::InvalidAmount);
+            }
+            // Reject empty memo (retirement reason) — beneficiary information must be meaningful.
+            if req.memo.len() == 0 {
+                panic!("beneficiary memo cannot be empty");
             }
             // Require KYC for every beneficiary.
             if th::get_kyc_state_of(&env, &req.beneficiary) != th::KycState::Approved {

@@ -30,6 +30,13 @@ pub enum KycError {
     MigrationVersionNotSequential = 10,
     /// Batch subjects list exceeds the maximum of 20 entries.
     BatchTooLarge = 11,
+    /// The address is already in the admin list.
+    AdminAlreadyExists = 12,
+    InvalidTier = 13,
+    InvalidExpiry = 14,
+    EmptyBatch = 15,
+    InvalidRevokeTier = 16,
+    DuplicateHistoryEntry = 17,
 }
 
 /// Composite key for per-subject lifecycle history entries.
@@ -168,6 +175,8 @@ pub struct KycRecord {
     pub status: KycStatus,
     pub verifier: Address,
     pub tier: u32,
+    // Ledger close time (discrete UNIX seconds from the Stellar network, not
+    // wall-clock) after which this record is considered expired. 0 = no expiry.
     pub expiry: u64,
     pub jurisdiction: String,
 }
@@ -205,6 +214,10 @@ impl KycRegistry {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         caller.require_auth();
         Self::require_admin(&env, &caller);
+        let list = Self::admin_list(&env);
+        if list.contains(&new_admin) {
+            panic_with_error!(env, KycError::AdminAlreadyExists);
+        }
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
@@ -219,12 +232,13 @@ impl KycRegistry {
             .instance()
             .get(&DataKey::PendingAdmin)
             .expect("no pending admin");
-        pending.require_auth();
         let mut list = Self::admin_list(&env);
-        if !list.contains(&pending) {
-            list.push_back(pending.clone());
-            env.storage().instance().set(&DataKey::AdminList, &list);
+        if list.contains(&pending) {
+            panic_with_error!(env, KycError::AdminAlreadyExists);
         }
+        pending.require_auth();
+        list.push_back(pending.clone());
+        env.storage().instance().set(&DataKey::AdminList, &list);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish((symbol_short!("admin_add"),), pending);
     }
@@ -234,10 +248,11 @@ impl KycRegistry {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         let mut list = Self::admin_list(&env);
-        if !list.contains(&new_admin) {
-            list.push_back(new_admin.clone());
-            env.storage().instance().set(&DataKey::AdminList, &list);
+        if list.contains(&new_admin) {
+            panic_with_error!(env, KycError::AdminAlreadyExists);
         }
+        list.push_back(new_admin.clone());
+        env.storage().instance().set(&DataKey::AdminList, &list);
         env.events()
             .publish((symbol_short!("admin_add"),), new_admin);
     }
@@ -247,7 +262,12 @@ impl KycRegistry {
         caller.require_auth();
         Self::require_admin(&env, &caller);
         let list = Self::admin_list(&env);
-        if list.len() <= 1 {
+        // Fail fast: an empty or missing admin list is an invalid state.
+        if list.is_empty() {
+            panic_with_error!(env, KycError::EmptyAdminList);
+        }
+        // Guard: removing the last admin would leave the registry permanently locked.
+        if list.len() == 1 {
             panic_with_error!(env, KycError::EmptyAdminList);
         }
         let mut new_list: Vec<Address> = Vec::new(&env);
@@ -358,6 +378,7 @@ impl KycRegistry {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier);
         Self::validate_jurisdiction(&env, &jurisdiction);
+        Self::validate_expiry(&env, expiry);
         Self::record_transition(
             &env,
             &subject,
@@ -381,14 +402,19 @@ impl KycRegistry {
     }
 
     pub fn approve_batch(env: Env, verifier: Address, subjects: Vec<(Address, u32, u64, String)>) {
+        if subjects.is_empty() {
+            panic_with_error!(env, KycError::EmptyBatch);
+        }
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         verifier.require_auth();
         Self::require_verifier(&env, &verifier);
         if subjects.len() > 20 {
             panic_with_error!(env, KycError::BatchTooLarge);
         }
+        let subjects_count = subjects.len();
         for (subject, tier, expiry, jurisdiction) in subjects.iter() {
             Self::validate_jurisdiction(&env, &jurisdiction);
+            Self::validate_expiry(&env, expiry);
             Self::record_transition(
                 &env,
                 &subject,
@@ -412,6 +438,8 @@ impl KycRegistry {
                 verifier.clone(),
             );
         }
+        env.events()
+            .publish((symbol_short!("batch_app"),), subjects_count);
     }
 
     pub fn reject(env: Env, verifier: Address, subject: Address) {
@@ -440,6 +468,9 @@ impl KycRegistry {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier);
         let mut record = Self::get_record_or_default(&env, subject.clone(), &verifier);
+        if record.tier > 2 {
+            panic_with_error!(env, KycError::InvalidRevokeTier);
+        }
         record.status = KycStatus::Revoked;
         Self::record_transition(
             &env,
@@ -494,6 +525,9 @@ impl KycRegistry {
             .unwrap_or_else(|| panic_with_error!(env, KycError::NoRecord));
         if record.status != KycStatus::Approved {
             panic_with_error!(env, KycError::NotApproved);
+        }
+        if new_tier > 2 {
+            panic_with_error!(env, KycError::InvalidTier);
         }
         record.tier = new_tier;
         Self::record_transition(
@@ -1083,6 +1117,12 @@ impl KycRegistry {
     fn validate_jurisdiction(env: &Env, jurisdiction: &String) {
         // Invalid jurisdiction attempts are not emitted as events to avoid
         // event-stream spam from malicious callers.
+        //
+        // Explicit empty-string guard: an empty jurisdiction is meaningless and
+        // must be rejected before any further processing.
+        if jurisdiction.is_empty() {
+            panic_with_error!(env, KycError::InvalidJurisdiction);
+        }
         if jurisdiction.len() != 2 {
             panic_with_error!(env, KycError::InvalidJurisdiction);
         }
@@ -1090,6 +1130,12 @@ impl KycRegistry {
         jurisdiction.copy_into_slice(&mut bytes);
         if bytes[0] < b'A' || bytes[0] > b'Z' || bytes[1] < b'A' || bytes[1] > b'Z' {
             panic_with_error!(env, KycError::InvalidJurisdiction);
+        }
+    }
+
+    fn validate_expiry(env: &Env, expiry: u64) {
+        if expiry != 0 && expiry <= env.ledger().timestamp() {
+            panic_with_error!(env, KycError::InvalidExpiry);
         }
     }
 
@@ -1153,6 +1199,18 @@ impl KycRegistry {
             timestamp: env.ledger().timestamp(),
         };
 
+        // Reject before any write if the next per-subject slot is already
+        // occupied, so a stale counter can never overwrite or duplicate history.
+        let scount_key = DataKey::SubjectVerifierLogCount(subject.clone());
+        let scount: u32 = env.storage().persistent().get(&scount_key).unwrap_or(0);
+        let skey = DataKey::SubjectVerifierLog(SubjectLogKey {
+            subject: subject.clone(),
+            seq: scount,
+        });
+        if env.storage().persistent().has(&skey) {
+            panic_with_error!(env, KycError::DuplicateHistoryEntry);
+        }
+
         // Global log (unchanged, required by revoke_all_by_verifier).
         let count: u32 = env
             .storage()
@@ -1169,12 +1227,6 @@ impl KycRegistry {
             .set(&DataKey::VerifierLogCount, &(count + 1));
 
         // Per-subject log — O(1) append.
-        let scount_key = DataKey::SubjectVerifierLogCount(subject.clone());
-        let scount: u32 = env.storage().persistent().get(&scount_key).unwrap_or(0);
-        let skey = DataKey::SubjectVerifierLog(SubjectLogKey {
-            subject: subject.clone(),
-            seq: scount,
-        });
         env.storage().persistent().set(&skey, &entry);
         env.storage()
             .persistent()
@@ -1216,6 +1268,9 @@ impl KycRegistry {
             subject: subject.clone(),
             seq,
         });
+        if env.storage().persistent().has(&entry_key) {
+            panic_with_error!(env, KycError::DuplicateHistoryEntry);
+        }
         env.storage().persistent().set(&entry_key, &transition);
         env.storage()
             .persistent()

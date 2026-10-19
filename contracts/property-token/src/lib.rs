@@ -203,21 +203,42 @@ pub struct PropertyToken;
 #[contractimpl]
 impl PropertyToken {
     fn validate_property_type(env: &Env, pt: &String) {
+        // Reject empty strings before comparison — an empty property_type must
+        // never reach storage because it is indistinguishable from an unset field.
+        if pt.len() == 0 {
+            panic_with_error!(env, PropertyError::InvalidMetadata);
+        }
         if *pt != String::from_str(env, "residential")
             && *pt != String::from_str(env, "commercial")
             && *pt != String::from_str(env, "land")
         {
-            panic!("invalid property_type");
+            panic_with_error!(env, PropertyError::InvalidMetadata);
+        }
+    }
+
+    fn require_non_blank(env: &Env, value: &String) {
+        if value.len() == 0 {
+            panic_with_error!(env, PropertyError::InvalidMetadata);
+        }
+        let len = value.len() as usize;
+        let mut buf = [0u8; 200];
+        value.copy_into_slice(&mut buf[..len]);
+        if buf[..len].iter().all(|&b| b == b' ') {
+            panic_with_error!(env, PropertyError::InvalidMetadata);
         }
     }
 
     fn validate_property_meta(env: &Env, meta: &PropertyMeta) {
+        Self::require_non_blank(env, &meta.property_id);
         if !th::is_valid_legal_entity(&meta.legal_name) {
             panic_with_error!(env, PropertyError::InvalidMetadata);
         }
+        Self::require_non_blank(env, &meta.legal_name);
         if !th::is_valid_legal_entity(&meta.jurisdiction) {
             panic_with_error!(env, PropertyError::InvalidMetadata);
         }
+        Self::require_non_blank(env, &meta.jurisdiction);
+        Self::require_non_blank(env, &meta.address);
         if !th::is_valid_ipfs_hash(&meta.ipfs_title_hash) {
             panic_with_error!(env, PropertyError::InvalidMetadata);
         }
@@ -395,6 +416,10 @@ impl PropertyToken {
     pub fn transfer(env: Env, from: Address, to: Address, shares: i128) {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         from.require_auth();
+        // Reject self-transfers to prevent accounting pollution.
+        if from == to {
+            panic!("self-transfer not allowed");
+        }
         match th::evaluate_transfer_compliance(&env, &from, &to, shares) {
             th::TransferDecision::Allow => {}
             th::TransferDecision::Deny(ref reason) => {
@@ -776,7 +801,7 @@ impl PropertyToken {
         let mut checkpoint = Self::settle_holder(&env, holder.clone());
         let amount = checkpoint.unclaimed_total;
         if amount <= 0 {
-            return 0;
+            panic_with_error!(env, PropertyError::InvalidDividendAmount);
         }
         checkpoint.unclaimed_total = 0;
         checkpoint.unclaimed_rent = 0;

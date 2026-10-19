@@ -120,6 +120,114 @@ fn test_metadata() {
 }
 
 #[test]
+#[should_panic]
+fn test_constructor_rejects_blank_name() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycRegistry, ());
+    KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let compliance_id = env.register(ComplianceEngine, ());
+    ComplianceEngineClient::new(&env, &compliance_id).initialize(&admin, &kyc_id, &0u64);
+
+    env.register(
+        RwaToken,
+        (
+            admin,
+            7u32,
+            String::from_str(&env, "   "),
+            String::from_str(&env, "VTRWA"),
+            String::from_str(&env, "property"),
+            kyc_id,
+            compliance_id,
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_empty_name() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycRegistry, ());
+    KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let compliance_id = env.register(ComplianceEngine, ());
+    ComplianceEngineClient::new(&env, &compliance_id).initialize(&admin, &kyc_id, &0u64);
+
+    env.register(
+        RwaToken,
+        (
+            admin,
+            7u32,
+            String::from_str(&env, ""),
+            String::from_str(&env, "VTRWA"),
+            String::from_str(&env, "property"),
+            kyc_id,
+            compliance_id,
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_blank_symbol() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycRegistry, ());
+    KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let compliance_id = env.register(ComplianceEngine, ());
+    ComplianceEngineClient::new(&env, &compliance_id).initialize(&admin, &kyc_id, &0u64);
+
+    env.register(
+        RwaToken,
+        (
+            admin,
+            7u32,
+            String::from_str(&env, "Veritoken RWA"),
+            String::from_str(&env, "   "),
+            String::from_str(&env, "property"),
+            kyc_id,
+            compliance_id,
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_empty_symbol() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycRegistry, ());
+    KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let compliance_id = env.register(ComplianceEngine, ());
+    ComplianceEngineClient::new(&env, &compliance_id).initialize(&admin, &kyc_id, &0u64);
+
+    env.register(
+        RwaToken,
+        (
+            admin,
+            7u32,
+            String::from_str(&env, "Veritoken RWA"),
+            String::from_str(&env, ""),
+            String::from_str(&env, "property"),
+            kyc_id,
+            compliance_id,
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+}
+
+#[test]
 fn test_mint_requires_kyc() {
     let h = setup();
     let user = Address::generate(&h.env);
@@ -553,6 +661,31 @@ fn test_invalid_asset_type() {
             compliance_id,
             Option::<ComplianceMetadata>::None,
             0i128,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_constructor_rejects_negative_max_supply() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycRegistry, ());
+    let compliance_id = env.register(ComplianceEngine, ());
+
+    // max_supply = 0 means "unlimited"; any negative cap is malformed.
+    let _ = env.register(
+        RwaToken,
+        (
+            admin,
+            7u32,
+            String::from_str(&env, "Bad Cap"),
+            String::from_str(&env, "BAD"),
+            String::from_str(&env, "invoice"),
+            kyc_id,
+            compliance_id,
+            Option::<ComplianceMetadata>::None,
+            -1i128,
         ),
     );
 }
@@ -2272,6 +2405,37 @@ fn test_recovery_configure_rejects_more_than_ten_members() {
 }
 
 #[test]
+fn test_recovery_configure_rejects_zero_threshold() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+    let h = setup();
+    let members = make_guardians(&h, 3);
+    let res = h.token.try_configure_recovery(&0, &members, &100);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::InvalidRecoveryConfig)
+    );
+    assert!(h.token.try_recovery_config().is_err());
+}
+
+#[test]
+fn test_recovery_configure_rejects_duplicate_members() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+    let h = setup();
+    let g = Address::generate(&h.env);
+    let other = Address::generate(&h.env);
+    // Without the guard, [g, g, other] with threshold 2 lets `g` alone meet quorum.
+    let members = soroban_sdk::vec![&h.env, g.clone(), g, other];
+    let res = h.token.try_configure_recovery(&2, &members, &100);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::InvalidRecoveryConfig)
+    );
+    assert!(h.token.try_recovery_members().is_err());
+}
+
+#[test]
 fn test_recovery_propose_and_read_active() {
     let h = setup();
     let members = make_guardians(&h, 3);
@@ -2288,21 +2452,60 @@ fn test_recovery_propose_and_read_active() {
 }
 
 #[test]
-fn test_recovery_propose_replaces_existing_proposal() {
+fn test_recovery_propose_rejects_while_proposal_active() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
     let h = setup();
     let members = make_guardians(&h, 3);
     let g1 = members.get(0).unwrap();
     let g2 = members.get(1).unwrap();
     h.token.configure_recovery(&2, &members, &100);
 
+    h.env.ledger().set_sequence_number(1000);
     let admin_a = Address::generate(&h.env);
-    let admin_b = Address::generate(&h.env);
     h.token.propose_recovery(&g1, &admin_a);
-    h.token.propose_recovery(&g2, &admin_b);
 
+    // Expiry = 1000 + 100/2 = 1050; the proposal is still live at the boundary.
+    h.env.ledger().set_sequence_number(1050);
+    let res = h
+        .token
+        .try_propose_recovery(&g2, &Address::generate(&h.env));
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::RecoveryAlreadyActive)
+    );
+    let proposal = h.token.active_recovery().unwrap();
+    assert_eq!(proposal.proposed_admin, admin_a);
+    assert_eq!(proposal.proposer, g1);
+
+    // Once expired, the stale proposal can be replaced.
+    h.env.ledger().set_sequence_number(1051);
+    let admin_b = Address::generate(&h.env);
+    h.token.propose_recovery(&g2, &admin_b);
     let proposal = h.token.active_recovery().unwrap();
     assert_eq!(proposal.proposed_admin, admin_b);
     assert_eq!(proposal.proposer, g2);
+}
+
+#[test]
+fn test_recovery_propose_rejects_unreachable_threshold() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+    let h = setup();
+    let members = make_guardians(&h, 3);
+    let g1 = members.get(0).unwrap();
+    // 3-of-3 passes configure, but the proposer cannot approve, so only 2
+    // approvals are ever reachable.
+    h.token.configure_recovery(&3, &members, &100);
+
+    let res = h
+        .token
+        .try_propose_recovery(&g1, &Address::generate(&h.env));
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::InvalidRecoveryConfig)
+    );
+    assert!(h.token.active_recovery().is_none());
 }
 
 #[test]
@@ -2380,6 +2583,35 @@ fn test_recovery_expired_proposal_blocks_approve() {
 }
 
 #[test]
+fn test_recovery_execute_rejects_expired_proposal() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+    let h = setup();
+    let members = make_guardians(&h, 3);
+    let g1 = members.get(0).unwrap();
+    let g2 = members.get(1).unwrap();
+    let g3 = members.get(2).unwrap();
+    h.token.configure_recovery(&2, &members, &100);
+    let nonce_before = h.token.admin_nonce();
+
+    h.env.ledger().set_sequence_number(1000);
+    h.token.propose_recovery(&g1, &Address::generate(&h.env));
+    h.token.approve_recovery(&g2);
+    h.token.approve_recovery(&g3);
+    // Fully approved, but expiry = 1000 + 100/2 = 1050.
+    h.env.ledger().set_sequence_number(1051);
+
+    let res = h.token.try_execute_recovery(&g1);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::RecoveryExpired)
+    );
+    assert_eq!(h.token.admin_nonce(), nonce_before);
+    assert_eq!(h.token.recovery_config().last_executed_ledger, 0);
+    assert!(h.token.active_recovery().is_some());
+}
+
+#[test]
 fn test_recovery_execute_replaces_admin_and_bumps_nonce() {
     let h = setup();
     let members = make_guardians(&h, 3);
@@ -2394,6 +2626,29 @@ fn test_recovery_execute_replaces_admin_and_bumps_nonce() {
     h.token.approve_recovery(&g2);
     h.token.approve_recovery(&g3);
     h.token.execute_recovery(&g1);
+
+    // recovery_executed event emitted with old/new admin (#670)
+    {
+        use soroban_sdk::{testutils::Events as _, symbol_short, TryFromVal};
+        let (_, topics, data) = h
+            .env
+            .events()
+            .all()
+            .iter()
+            .rev()
+            .find(|(_, topics, _)| {
+                topics.len() == 1
+                    && TryFromVal::try_from_val(&h.env, &topics.get(0).unwrap())
+                        .map(|topic: soroban_sdk::Symbol| topic == symbol_short!("rcv_exe"))
+                        .unwrap_or(false)
+            })
+            .expect("recovery_executed event should be emitted");
+        assert_eq!(topics.len(), 1);
+        let (old_admin, emitted_new_admin): (Address, Address) =
+            TryFromVal::try_from_val(&h.env, &data).unwrap();
+        assert_eq!(emitted_new_admin, new_admin);
+        assert_ne!(old_admin, new_admin);
+    }
 
     // Active proposal cleared
     assert!(h.token.active_recovery().is_none());
@@ -2583,6 +2838,17 @@ fn test_propose_admin_rejects_current_admin() {
 }
 
 #[test]
+fn test_accept_admin_no_pending() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+
+    let h = setup();
+    // No propose_admin call has been made, so there is no pending admin.
+    let res = h.token.try_accept_admin();
+    assert_eq!(res.unwrap_err().unwrap(), Error::from(RwaError::NoPendingAdmin));
+}
+
+#[test]
 fn test_propose_admin_accepts_different_address() {
     let h = setup();
     let new_admin = Address::generate(&h.env);
@@ -2721,5 +2987,155 @@ fn test_burn_entire_supply() {
         h.compliance.holder_count(),
         0,
         "holder must be deregistered after balance is drained to zero"
+    );
+}
+
+// ── Regression tests for RwaToken::__constructor asset_type fix ───────────────
+
+/// An empty asset_type string must be rejected.
+///
+/// Before the fix, the empty-string guard was absent; the code fell through to
+/// the known-values comparison block which also rejected it, but without a
+/// documented, early-exit boundary check that makes the intent explicit and
+/// auditable.  This test pins the early-exit behavior.
+///
+/// Uses `#[should_panic]` — same convention as `test_invalid_asset_type` above.
+#[test]
+#[should_panic]
+fn test_constructor_rejects_empty_asset_type() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    let kyc_id = env.register(KycRegistry, ());
+    let kyc = KycRegistryClient::new(&env, &kyc_id);
+    kyc.initialize(&admin);
+
+    let compliance_id = env.register(ComplianceEngine, ());
+    let compliance = ComplianceEngineClient::new(&env, &compliance_id);
+    compliance.initialize(&admin, &kyc_id, &0u64);
+
+    // Empty string is not a recognised asset category — must panic.
+    let _ = env.register(
+        RwaToken,
+        (
+            admin.clone(),
+            7u32,
+            String::from_str(&env, "Empty Type Token"),
+            String::from_str(&env, "ETT"),
+            String::from_str(&env, ""), // empty asset_type — triggers early guard
+            kyc_id.clone(),
+            compliance_id.clone(),
+            Option::<ComplianceMetadata>::None,
+            0i128,
+        ),
+    );
+}
+
+/// A known asset type immediately following an empty-string check still works.
+/// This test confirms the early-exit guard does not break the happy path.
+#[test]
+fn test_constructor_accepts_valid_asset_type_after_empty_guard() {
+    for asset_type in ["invoice", "property", "carbon_credit"] {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let kyc_id = env.register(KycRegistry, ());
+        let kyc = KycRegistryClient::new(&env, &kyc_id);
+        kyc.initialize(&admin);
+
+        let compliance_id = env.register(ComplianceEngine, ());
+        let compliance = ComplianceEngineClient::new(&env, &compliance_id);
+        compliance.initialize(&admin, &kyc_id, &0u64);
+
+        let token_id = env.register(
+            RwaToken,
+            (
+                admin.clone(),
+                7u32,
+                String::from_str(&env, "Valid Token"),
+                String::from_str(&env, "VLD"),
+                String::from_str(&env, asset_type),
+                kyc_id.clone(),
+                compliance_id.clone(),
+                Option::<ComplianceMetadata>::None,
+                0i128,
+            ),
+        );
+        let token = RwaTokenClient::new(&env, &token_id);
+        assert_eq!(
+            token.asset_type(),
+            String::from_str(&env, asset_type),
+            "asset_type '{}' must be accepted and stored correctly",
+            asset_type
+        );
+    }
+}
+
+// ── Regression: approve_recovery duplicate-guardian guard ────────────────────
+
+/// A guardian who has already approved the active proposal must not be able
+/// to approve a second time.  Without the guard, a single guardian could
+/// push the approval count above the threshold by calling approve_recovery
+/// multiple times, making the proposal appear stronger than it actually is.
+///
+/// This test pins the guard: a second call from the same guardian returns
+/// AlreadyApproved and the approval count remains unchanged.
+#[test]
+fn test_approve_recovery_duplicate_guardian_rejected() {
+    use crate::RwaError;
+    use soroban_sdk::Error;
+
+    let h = setup();
+    // 3-guardian, threshold-2 setup.
+    let members = make_guardians(&h, 3);
+    let g1 = members.get(0).unwrap();
+    let g2 = members.get(1).unwrap();
+    h.token.configure_recovery(&2, &members, &100);
+    h.token.propose_recovery(&g1, &Address::generate(&h.env));
+
+    // First approval from g2 succeeds.
+    h.token.approve_recovery(&g2);
+    let after_first = h.token.active_recovery().unwrap();
+    assert_eq!(after_first.approvals.len(), 1);
+
+    // Second approval from the same guardian must be rejected.
+    let res = h.token.try_approve_recovery(&g2);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(RwaError::AlreadyApproved),
+        "duplicate approval must return AlreadyApproved"
+    );
+
+    // Approval count must not have changed — threshold distortion is prevented.
+    let after_dup = h.token.active_recovery().unwrap();
+    assert_eq!(
+        after_dup.approvals.len(),
+        1,
+        "approval count must remain 1 after rejected duplicate"
+    );
+}
+
+/// Confirm the normal multi-guardian approval path is not affected: two
+/// distinct guardians each approve once and the count reaches 2.
+#[test]
+fn test_approve_recovery_two_distinct_guardians_both_count() {
+    let h = setup();
+    let members = make_guardians(&h, 3);
+    let g1 = members.get(0).unwrap();
+    let g2 = members.get(1).unwrap();
+    let g3 = members.get(2).unwrap();
+    h.token.configure_recovery(&2, &members, &100);
+    h.token.propose_recovery(&g1, &Address::generate(&h.env));
+
+    h.token.approve_recovery(&g2);
+    h.token.approve_recovery(&g3);
+
+    let proposal = h.token.active_recovery().unwrap();
+    assert_eq!(
+        proposal.approvals.len(),
+        2,
+        "two distinct approvals must both be recorded"
     );
 }

@@ -57,6 +57,11 @@ pub enum InvoiceError {
     LifecyclePaused = 19,
     /// Metadata field contains an invalid value (e.g. malformed ISIN or currency code).
     InvalidMetadata = 20,
+    /// Returned when `append_journal_entry` is called with an empty event tag.
+    /// Every journal entry must carry a meaningful non-empty tag so that the
+    /// lifecycle audit log remains inspectable and each entry can be identified
+    /// without ambiguity.
+    EmptyEventTag = 21,
 }
 
 // ── Lifecycle state machine ───────────────────────────────────────────────────
@@ -82,6 +87,7 @@ pub enum InvoiceStatus {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct JournalEntry {
+    pub event_tag: String,
     pub from_status: InvoiceStatus,
     pub to_status: InvoiceStatus,
     pub ledger: u32,
@@ -220,6 +226,9 @@ impl InvoiceToken {
         if th::get_kyc_state_of(&env, &addr) != th::KycState::Approved {
             panic_with_error!(env, InvoiceError::KycNotApproved);
         }
+        if !Self::has_positive_transfer_fee(&env) {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
         // Verify the address passes a self-to-self compliance check (catches blocklist/pause).
         match th::evaluate_transfer_compliance(&env, &addr, &addr, 0) {
             th::TransferDecision::Allow => {}
@@ -307,6 +316,32 @@ impl InvoiceToken {
         Self::do_create_invoice(&env, meta);
     }
 
+    /// List invoice IDs with pagination (zero-based offset, page size 1–50).
+    /// Panics with `InvalidMetadata` when `page_size` is zero or exceeds 50.
+    pub fn get_invoices_page(env: Env, page: u32, page_size: u32) -> Vec<String> {
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        const MAX_PAGE_SIZE: u32 = 50;
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+        let list: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoicesList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = list.len();
+        let start = page.saturating_mul(page_size);
+        let mut result: Vec<String> = Vec::new(&env);
+        if start >= total {
+            return result;
+        }
+        let end = (start + page_size).min(total);
+        for i in start..end {
+            result.push_back(list.get(i).expect("index in bounds"));
+        }
+        result
+    }
+
     /// List invoice IDs with pagination (zero-based offset, capped at 50).
     pub fn list_invoices(env: Env, start: u32, limit: u32) -> Vec<String> {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
@@ -354,6 +389,31 @@ impl InvoiceToken {
         env.events().publish((symbol_short!("upd_meta"),), ());
     }
 
+    /// Set or clear an invoice's notification webhook. Admin-only.
+    /// An empty string explicitly clears the webhook; any other value must be
+    /// a valid "https://" URL and is validated before storage is written.
+    pub fn set_webhook(env: Env, invoice_id: String, webhook: String) {
+        th::require_admin(&env);
+        let key = DataKey::InvoiceMeta(invoice_id.clone());
+        let mut meta: InvoiceMeta = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::InvoiceNotFound));
+        if webhook.is_empty() {
+            meta.notification_webhook = String::from_str(&env, "");
+            env.storage().persistent().set(&key, &meta);
+            env.events()
+                .publish((symbol_short!("wh_clear"),), invoice_id);
+            return;
+        }
+        Self::validate_webhook(&env, &webhook);
+        meta.notification_webhook = webhook.clone();
+        env.storage().persistent().set(&key, &meta);
+        env.events()
+            .publish((symbol_short!("wh_set"),), (invoice_id, webhook));
+    }
+
     pub fn name(env: Env) -> String {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         String::from_str(&env, "Veritoken Invoice")
@@ -379,6 +439,53 @@ impl InvoiceToken {
     pub fn get_journal(env: Env, invoice_id: String) -> Vec<JournalEntry> {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         Self::read_journal(&env, &invoice_id)
+    }
+
+    /// Append a custom journal entry to an invoice's audit log.
+    ///
+    /// The `event_tag` must be a non-empty string that identifies the type of
+    /// event being recorded.  An empty tag is rejected before any state is
+    /// written so that the lifecycle journal always contains identifiable,
+    /// meaningful entries.
+    ///
+    /// Returns `InvoiceError::EmptyEventTag` when `event_tag` is empty.
+    pub fn append_journal_entry(env: Env, invoice_id: String, event_tag: String) {
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        th::require_admin(&env);
+        // Reject empty event tags before touching any state.  An entry with
+        // no tag cannot be identified during audit log inspection and reduces
+        // confidence in the lifecycle record.
+        if event_tag.len() == 0 {
+            panic_with_error!(env, InvoiceError::EmptyEventTag);
+        }
+        // Verify the invoice exists before writing.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::InvoiceMeta(invoice_id.clone()))
+        {
+            panic_with_error!(env, InvoiceError::InvoiceNotFound);
+        }
+        let current_status = Self::read_status(&env, &invoice_id);
+        let entry = JournalEntry {
+            event_tag: event_tag.clone(),
+            from_status: current_status,
+            to_status: current_status,
+            ledger: env.ledger().sequence(),
+            timestamp: env.ledger().timestamp(),
+        };
+        let mut journal = Self::read_journal(&env, &invoice_id);
+        journal.push_back(entry);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Journal(invoice_id.clone()), &journal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Journal(invoice_id.clone()),
+            THRESHOLD,
+            BUMP,
+        );
+        env.events()
+            .publish((symbol_short!("jrn_add"),), (invoice_id, event_tag));
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -456,6 +563,11 @@ impl InvoiceToken {
             .persistent()
             .get(&DataKey::InvoiceMeta(invoice_id.clone()))
             .expect("invoice must exist");
+
+        // Guard: face_value_usd must be positive before any state is written.
+        if meta.face_value_usd <= 0 {
+            panic_with_error!(env, InvoiceError::UnderSettlement);
+        }
 
         let from_status = Self::read_status(&env, &invoice_id);
         if matches!(
@@ -596,6 +708,11 @@ impl InvoiceToken {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         from.require_auth();
         Self::require_lifecycle_active(&env);
+
+        // Guard: redemption amount must be positive before any state is read or written.
+        if amount <= 0 {
+            panic_with_error!(env, InvoiceError::UnderSettlement);
+        }
 
         let status = Self::read_status(&env, &invoice_id);
         if !matches!(
@@ -829,6 +946,7 @@ impl InvoiceToken {
     /// to prevent over-redemption after the transfer.
     pub fn transfer(env: Env, invoice_id: String, from: Address, to: Address, amount: i128) {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        Self::validate_kyc_reference(&env, &invoice_id);
         from.require_auth();
 
         let status = Self::read_status(&env, &invoice_id);
@@ -853,16 +971,7 @@ impl InvoiceToken {
         if amount < 0 {
             panic_with_error!(env, InvoiceError::NegativeAmount);
         }
-        match th::evaluate_transfer_compliance(&env, &from, &to, amount) {
-            th::TransferDecision::Allow => {}
-            th::TransferDecision::Deny(ref reason) => {
-                if th::is_kyc_deny_reason(reason) {
-                    panic_with_error!(env, InvoiceError::KycNotApproved);
-                } else {
-                    panic_with_error!(env, InvoiceError::TransferBlocked);
-                }
-            }
-        }
+        Self::evaluate_transfer_kyc(&env, &from, &to, amount);
 
         // ── Fee deduction ────────────────────────────────────────────────
         // Compute fee: floor(amount * transfer_fee_bps / 10_000).
@@ -985,6 +1094,7 @@ impl InvoiceToken {
         to: Address,
         amount: i128,
     ) {
+        Self::validate_kyc_reference(&env, &invoice_id);
         spender.require_auth();
 
         let status = Self::read_status(&env, &invoice_id);
@@ -1009,16 +1119,7 @@ impl InvoiceToken {
         if amount < 0 {
             panic_with_error!(env, InvoiceError::NegativeAmount);
         }
-        match th::evaluate_transfer_compliance(&env, &from, &to, amount) {
-            th::TransferDecision::Allow => {}
-            th::TransferDecision::Deny(ref reason) => {
-                if th::is_kyc_deny_reason(reason) {
-                    panic_with_error!(env, InvoiceError::KycNotApproved);
-                } else {
-                    panic_with_error!(env, InvoiceError::TransferBlocked);
-                }
-            }
-        }
+        Self::evaluate_transfer_kyc(&env, &from, &to, amount);
 
         let allowance =
             Self::read_allowance(&env, from.clone(), spender.clone(), invoice_id.clone());
@@ -1236,9 +1337,24 @@ impl InvoiceToken {
             .unwrap_or_else(|| Vec::new(env))
     }
 
+    fn journal_event_tag(env: &Env, to: InvoiceStatus) -> String {
+        match to {
+            InvoiceStatus::Created => String::from_str(env, "created"),
+            InvoiceStatus::Issued => String::from_str(env, "issued"),
+            InvoiceStatus::PartiallySettled => String::from_str(env, "partially_settled"),
+            InvoiceStatus::FullySettled => String::from_str(env, "fully_settled"),
+            InvoiceStatus::Redeemed => String::from_str(env, "redeemed"),
+        }
+    }
+
     /// Atomically records a journal entry and writes the new status.
     fn transition_status(env: &Env, invoice_id: &String, from: InvoiceStatus, to: InvoiceStatus) {
+        let event_tag = Self::journal_event_tag(env, to);
+        if event_tag.is_empty() {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
         let entry = JournalEntry {
+            event_tag,
             from_status: from,
             to_status: to,
             ledger: env.ledger().sequence(),
@@ -1287,8 +1403,67 @@ impl InvoiceToken {
         if meta.face_value_usd <= 0 {
             panic_with_error!(env, InvoiceError::InvalidMetadata);
         }
+        // Discount rate is expressed in basis points; anything above 100% is malformed.
+        if meta.discount_rate_bps > 10_000 {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
         if !th::is_valid_ipfs_hash(&meta.ipfs_doc_hash) {
             panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+        // Fee is amount * bps / 10_000; above 100% the net transfer goes negative.
+        if meta.transfer_fee_bps > 10_000 {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+    }
+
+    fn has_positive_transfer_fee(env: &Env) -> bool {
+        let list: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoicesList)
+            .unwrap_or_else(|| Vec::new(env));
+        for invoice_id in list {
+            if let Some(meta) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, InvoiceMeta>(&DataKey::InvoiceMeta(invoice_id))
+            {
+                if meta.transfer_fee_bps > 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn validate_kyc_reference(env: &Env, value: &String) {
+        let len = value.len() as usize;
+        if len == 0 {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+        let mut buf = [0u8; 256];
+        value.copy_into_slice(&mut buf[..len]);
+        if buf[..len].iter().all(|b| b.is_ascii_whitespace()) {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+    }
+
+    fn evaluate_transfer_kyc(env: &Env, from: &Address, to: &Address, amount: i128) {
+        if th::get_kyc_state_of(env, from) != th::KycState::Approved {
+            panic_with_error!(env, InvoiceError::KycNotApproved);
+        }
+        if th::get_kyc_state_of(env, to) != th::KycState::Approved {
+            panic_with_error!(env, InvoiceError::KycNotApproved);
+        }
+        match th::evaluate_transfer_compliance(env, from, to, amount) {
+            th::TransferDecision::Allow => {}
+            th::TransferDecision::Deny(ref reason) => {
+                if th::is_kyc_deny_reason(reason) {
+                    panic_with_error!(env, InvoiceError::KycNotApproved);
+                } else {
+                    panic_with_error!(env, InvoiceError::TransferBlocked);
+                }
+            }
         }
     }
 
@@ -1296,6 +1471,10 @@ impl InvoiceToken {
         Self::validate_webhook(env, &meta.notification_webhook);
         Self::validate_invoice_meta(env, &meta);
         let invoice_id = meta.invoice_id.clone();
+        // Guard: invoice_id must not be empty.
+        if invoice_id.is_empty() {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
         if env
             .storage()
             .persistent()

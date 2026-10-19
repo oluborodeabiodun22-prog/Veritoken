@@ -92,6 +92,8 @@ pub enum RwaError {
     NoPendingAdmin = 32,
     /// propose_admin was called with the current admin as successor.
     AlreadyAdmin = 33,
+    /// Token metadata contains an empty or blank required field.
+    InvalidMetadata = 34,
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -214,6 +216,19 @@ impl RwaToken {
         compliance_metadata: Option<ComplianceMetadata>,
         max_supply: i128,
     ) {
+        // Reject empty or whitespace-only token metadata before any state is
+        // written (including the admin), so a nearly blank token definition
+        // can never reach wallets, front ends, or deployed registries.
+        if metadata::is_blank(&name) || metadata::is_blank(&symbol) {
+            panic_with_error!(env, RwaError::InvalidMetadata);
+        }
+        // Reject an empty asset_type immediately — an empty string slips past
+        // a naive length check and would persist as ambiguous contract state.
+        // This guard runs before the known-values check so the error is always
+        // InvalidAssetType regardless of how the caller produced the empty value.
+        if asset_type.is_empty() {
+            panic_with_error!(env, RwaError::InvalidAssetType);
+        }
         if asset_type != String::from_str(&env, "invoice")
             && asset_type != String::from_str(&env, "property")
             && asset_type != String::from_str(&env, "carbon_credit")
@@ -373,6 +388,7 @@ impl RwaToken {
     // ── SEP-41 Token Interface ────────────────────────────────────────────────
 
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        // Instance TTL is extended by the first storage helper called in this function.
         allowance::read_allowance(&env, from, spender).amount
     }
 
@@ -395,6 +411,7 @@ impl RwaToken {
     }
 
     pub fn balance(env: Env, id: Address) -> i128 {
+        // Instance TTL is extended by the first storage helper called in this function.
         balance::read_balance(&env, id)
     }
 
@@ -404,6 +421,7 @@ impl RwaToken {
     /// Sequence: guard → auth → validate_sender → validate_recipient →
     ///           apply_transfer_leg → unregister_holder (if drained) → emit → unlock.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        // Instance TTL is extended by the first storage helper called in this function.
         Self::enter_transfer_guard(&env);
         from.require_auth();
         let mut recipients = Vec::new(&env);
@@ -423,12 +441,16 @@ impl RwaToken {
         let mut recipients = Vec::new(&env);
         recipients.push_back(RecipientEntry { to, amount });
         let plan = Self::prepare_transfer_plan(&env, &from, &recipients);
+        // spender == from is allowed; the holder may approve themselves, though
+        // transfer() is simpler. Behaves the same as a direct transfer with an
+        // extra allowance step.
         allowance::spend_allowance(&env, from.clone(), spender, plan.total_amount);
         Self::execute_transfer_plan(&env, &from, &recipients, &plan);
         Self::exit_transfer_guard(&env);
     }
 
     pub fn burn(env: Env, from: Address, amount: i128) {
+        // Instance TTL is extended by the first storage helper called in this function.
         from.require_auth();
         if amount <= 0 {
             panic_with_error!(env, RwaError::NegativeAmount);
@@ -494,6 +516,7 @@ impl RwaToken {
     /// Mints `amount` tokens to `to`.
     /// `caller` must be the admin or the `"liquidity"` role holder.
     pub fn mint(env: Env, caller: Address, to: Address, amount: i128) {
+        // Instance TTL is extended by the first storage helper called in this function.
         roles::require_admin_or_role(&env, &caller, &Symbol::new(&env, roles::ROLE_LIQUIDITY));
         if amount <= 0 {
             panic_with_error!(env, RwaError::NegativeAmount);
@@ -537,6 +560,7 @@ impl RwaToken {
         from.require_auth();
         let plan = Self::prepare_transfer_plan(&env, &from, &recipients);
         Self::execute_transfer_plan(&env, &from, &recipients, &plan);
+        events::emit_batch_transfer_completed(&env, recipients.len() as u32);
         Self::exit_transfer_guard(&env);
     }
 
@@ -553,6 +577,7 @@ impl RwaToken {
         let plan = Self::prepare_transfer_plan(&env, &from, &recipients);
         allowance::spend_allowance(&env, from.clone(), spender, plan.total_amount);
         Self::execute_transfer_plan(&env, &from, &recipients, &plan);
+        events::emit_batch_transfer_completed(&env, recipients.len() as u32);
         Self::exit_transfer_guard(&env);
     }
 
@@ -1013,7 +1038,7 @@ impl RwaToken {
 
     /// Configures the M-of-N guardian recovery system. Admin-only.
     ///
-    /// Requires 2 ≤ threshold ≤ members.len() ≤ 10.
+    /// Requires 2 ≤ threshold ≤ members.len() ≤ 10 and no duplicate members.
     /// Clears any active recovery proposal to prevent stale proposals from
     /// executing under a new configuration.
     pub fn configure_recovery(env: Env, threshold: u32, members: Vec<Address>, cooldown: u32) {
@@ -1023,6 +1048,13 @@ impl RwaToken {
         let n = members.len();
         if threshold < 2 || threshold > n || n > 10 {
             panic_with_error!(env, RwaError::InvalidRecoveryConfig);
+        }
+        // Duplicate guardians would inflate N and let one key count twice.
+        for i in 0..n {
+            let m = members.get_unchecked(i);
+            if members.first_index_of(&m) != Some(i) {
+                panic_with_error!(env, RwaError::InvalidRecoveryConfig);
+            }
         }
 
         let last_executed_ledger: u64 = env
@@ -1054,14 +1086,35 @@ impl RwaToken {
         events::emit_recovery_configured(&env, threshold, n);
     }
 
-    /// Opens a new recovery proposal, replacing any prior one. Guardian-only.
+    /// Opens a new recovery proposal. Guardian-only.
     ///
-    /// The proposal expires after `cooldown_ledgers / 2` ledgers.
+    /// The proposal expires after `cooldown_ledgers / 2` ledgers. An expired
+    /// proposal is replaced; a still-live one must be executed or cancelled first.
+    ///
+    /// Panics if:
+    /// - the threshold cannot be met by the non-proposer guardians
+    /// - an unexpired proposal is already active
     pub fn propose_recovery(env: Env, caller: Address, proposed_admin: Address) {
         caller.require_auth();
         let cfg = Self::read_recovery_config(&env);
         let members = Self::read_recovery_members(&env);
         Self::assert_recovery_member(&env, &caller, &members);
+
+        // The proposer cannot approve, so at most members.len() - 1 approvals
+        // are reachable.
+        if cfg.threshold == 0 || cfg.threshold >= members.len() {
+            panic_with_error!(env, RwaError::InvalidRecoveryConfig);
+        }
+
+        if let Some(active) = env
+            .storage()
+            .instance()
+            .get::<_, RecoveryProposal>(&storage_types::DataKey::ActiveRecovery)
+        {
+            if env.ledger().sequence() as u64 <= active.expiry_ledger {
+                panic_with_error!(env, RwaError::RecoveryAlreadyActive);
+            }
+        }
 
         let expiry_ledger = env.ledger().sequence() as u64 + cfg.cooldown_ledgers as u64 / 2;
         let approvals: Vec<Address> = Vec::new(&env);
@@ -1142,6 +1195,7 @@ impl RwaToken {
             .get(&storage_types::DataKey::ActiveRecovery)
             .unwrap_or_else(|| panic_with_error!(env, RwaError::NoActiveRecovery));
 
+        // Reject stale proposals before any admin handoff or state write.
         let seq = env.ledger().sequence() as u64;
         if seq > proposal.expiry_ledger {
             panic_with_error!(env, RwaError::RecoveryExpired);

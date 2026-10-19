@@ -68,6 +68,31 @@ pub enum ComplianceError {
     InvalidRiskConfig = 8,
     AlreadyAtSchemaVersion = 9,
     MigrationVersionNotSequential = 10,
+    /// Returned when an address that is already on the blocklist is submitted
+    /// for allowlist addition.  Storing a blocklisted address on the allowlist
+    /// creates a contradictory enforcement state and is rejected eagerly.
+    BlocklistedAddressOnAllowlist = 11,
+    /// Returned when `set_tier_policy` receives a `TierPolicy` whose
+    /// `max_transfer_amount` is negative.  A negative cap is nonsensical and
+    /// would silently bypass the amount check inside `evaluate_transfer_inner`.
+    NegativeTierTransferAmount = 12,
+    /// Returned when `propose_rules` or `migrate_schema` receives an empty description
+    /// string.  Every governance proposal must carry a human-readable reason
+    /// so the policy audit trail remains meaningful.
+    EmptyDescription = 13,
+    /// Holder timestamps must be positive Unix timestamps.
+    InvalidHolderSince = 14,
+    InvalidTierPolicy = 15,
+    /// Returned when `deny_transfer` is called with an empty evaluation reason.
+    /// Every manual transfer denial must carry a non-empty human-readable
+    /// reason so that the compliance audit trail remains meaningful and
+    /// debugging is possible.
+    EmptyEvaluationReason = 16,
+    /// Returned when `append_policy_record` is called with an empty governance
+    /// comment.  Every admin-initiated policy log entry must carry a
+    /// human-readable description so that the audit trail is interpretable
+    /// after the fact.
+    EmptyGovernanceComment = 17,
 }
 
 // ── Tier policy types ─────────────────────────────────────────────────────────
@@ -275,7 +300,7 @@ impl ComplianceEngine {
             .instance()
             .set(&DataKey::MigrationCount, &0u32);
         // Record version 0 — the initial policy.
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             default_rules,
             PolicyChangeKind::ImmediateRuleUpdate,
@@ -317,6 +342,13 @@ impl ComplianceEngine {
     /// `rule_change_delay` seconds have elapsed.
     pub fn propose_rules(env: Env, new_rules: ComplianceRules, description: String) {
         Self::require_admin(&env);
+        // Every governance proposal must carry a non-empty description so that
+        // the on-chain policy audit trail remains meaningful.  An empty string
+        // would produce a `PolicyRecord` with no human-readable context, making
+        // it impossible to understand why a rule change was made after the fact.
+        if description.len() == 0 {
+            panic_with_error!(env, ComplianceError::EmptyDescription);
+        }
         Self::validate_rules(&env, &new_rules);
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let delay: u64 = env
@@ -354,7 +386,7 @@ impl ComplianceEngine {
             .instance()
             .set(&DataKey::Rules, &proposal.rules);
         env.storage().instance().remove(&DataKey::PendingProposal);
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             proposal.rules,
             PolicyChangeKind::DelayedRuleActivation,
@@ -369,7 +401,7 @@ impl ComplianceEngine {
         Self::validate_rules(&env, &rules);
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         env.storage().instance().set(&DataKey::Rules, &rules);
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             rules,
             PolicyChangeKind::ImmediateRuleUpdate,
@@ -404,7 +436,7 @@ impl ComplianceEngine {
             .expect("rules must be set");
         rules.paused = true;
         env.storage().instance().set(&DataKey::Rules, &rules);
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             rules,
             PolicyChangeKind::Pause,
@@ -423,7 +455,7 @@ impl ComplianceEngine {
             .expect("rules must be set");
         rules.paused = false;
         env.storage().instance().set(&DataKey::Rules, &rules);
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             rules,
             PolicyChangeKind::Unpause,
@@ -436,41 +468,42 @@ impl ComplianceEngine {
 
     pub fn add_to_blocklist(env: Env, addr: Address) {
         Self::require_admin(&env);
-        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let entry_key = DataKey::BlocklistEntry(addr.clone());
-        if !env.storage().persistent().has(&entry_key) {
-            env.storage().persistent().set(&entry_key, &true);
-            env.storage()
-                .persistent()
-                .extend_ttl(&entry_key, THRESHOLD, BUMP);
-            let size: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::BlocklistSize)
-                .unwrap_or(0);
-            let member_key = DataKey::BlocklistMember(size);
-            env.storage().persistent().set(&member_key, &addr);
-            env.storage()
-                .persistent()
-                .extend_ttl(&member_key, THRESHOLD, BUMP);
-            env.storage()
-                .persistent()
-                .set(&DataKey::BlocklistSize, &(size + 1));
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::BlocklistSize, THRESHOLD, BUMP);
-            let rules: ComplianceRules = env
-                .storage()
-                .instance()
-                .get(&DataKey::Rules)
-                .expect("rules must be set");
-            Self::append_policy_record(
-                &env,
-                rules,
-                PolicyChangeKind::BlocklistAdd,
-                String::from_str(&env, ""),
-            );
+        if env.storage().persistent().has(&entry_key) {
+            return;
         }
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        env.storage().persistent().set(&entry_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&entry_key, THRESHOLD, BUMP);
+        let size: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BlocklistSize)
+            .unwrap_or(0);
+        let member_key = DataKey::BlocklistMember(size);
+        env.storage().persistent().set(&member_key, &addr);
+        env.storage()
+            .persistent()
+            .extend_ttl(&member_key, THRESHOLD, BUMP);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BlocklistSize, &(size + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BlocklistSize, THRESHOLD, BUMP);
+        let rules: ComplianceRules = env
+            .storage()
+            .instance()
+            .get(&DataKey::Rules)
+            .expect("rules must be set");
+        Self::write_policy_record(
+            &env,
+            rules,
+            PolicyChangeKind::BlocklistAdd,
+            String::from_str(&env, ""),
+        );
         env.events().publish((symbol_short!("blocked"),), addr);
     }
 
@@ -529,7 +562,7 @@ impl ComplianceEngine {
             .instance()
             .get(&DataKey::Rules)
             .expect("rules must be set");
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             rules,
             PolicyChangeKind::BlocklistRemove,
@@ -581,6 +614,19 @@ impl ComplianceEngine {
     pub fn add_to_allowlist(env: Env, addr: Address) {
         Self::require_admin(&env);
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        // Reject the addition when the address is already on the blocklist.
+        // Storing a blocklisted address on the allowlist would create a
+        // contradictory enforcement state: the blocklist check in
+        // `evaluate_transfer_inner` always wins, so the allowlist entry would
+        // never have effect but would silently consume storage and mislead
+        // auditors reading the policy history.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::BlocklistEntry(addr.clone()))
+        {
+            panic_with_error!(env, ComplianceError::BlocklistedAddressOnAllowlist);
+        }
         let entry_key = DataKey::AllowlistEntry(addr.clone());
         if !env.storage().persistent().has(&entry_key) {
             env.storage().persistent().set(&entry_key, &true);
@@ -608,7 +654,7 @@ impl ComplianceEngine {
                 .instance()
                 .get(&DataKey::Rules)
                 .expect("rules must be set");
-            Self::append_policy_record(
+            Self::write_policy_record(
                 &env,
                 rules,
                 PolicyChangeKind::AllowlistAdd,
@@ -673,7 +719,7 @@ impl ComplianceEngine {
             .instance()
             .get(&DataKey::Rules)
             .expect("rules must be set");
-        Self::append_policy_record(
+        Self::write_policy_record(
             &env,
             rules,
             PolicyChangeKind::AllowlistRemove,
@@ -782,6 +828,54 @@ impl ComplianceEngine {
         amount: i128,
     ) -> TransferDecision {
         Self::evaluate_transfer_inner(&env, &from, &to, amount, true)
+    }
+
+    /// Explicitly deny a transfer and record the denial reason on-chain.
+    ///
+    /// This entry point is used when an admin or compliance officer needs to
+    /// manually log a transfer refusal with a human-readable explanation.
+    /// An empty `reason` is rejected before any state is written so that the
+    /// compliance audit trail always contains actionable information.
+    ///
+    /// Returns `ComplianceError::EmptyEvaluationReason` when `reason` is empty.
+    pub fn deny_transfer(env: Env, from: Address, to: Address, amount: i128, reason: String) {
+        Self::require_admin(&env);
+        // Reject empty reasons before touching any state.  A blank reason
+        // makes debugging impossible and produces a compliance record with no
+        // human-readable context — the audit trail entry would be effectively
+        // useless.
+        if reason.len() == 0 {
+            panic_with_error!(env, ComplianceError::EmptyEvaluationReason);
+        }
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        env.events()
+            .publish((symbol_short!("deny_xfr"),), (from, to, amount, reason));
+    }
+
+    /// Append a governance comment to the policy history.
+    ///
+    /// This entry point is used when an admin needs to record a free-form
+    /// governance note alongside the current rule snapshot.  An empty
+    /// `comment` is rejected before any state is written so that the policy
+    /// audit trail only contains entries with actionable context.
+    ///
+    /// Returns `ComplianceError::EmptyGovernanceComment` when `comment` is empty.
+    pub fn append_policy_record(env: Env, comment: String) {
+        Self::require_admin(&env);
+        // Reject blank comments before touching any state.  A blank
+        // governance comment makes the policy audit trail hard to interpret
+        // and cannot support a clear narrative for later reviews.
+        if comment.len() == 0 {
+            panic_with_error!(env, ComplianceError::EmptyGovernanceComment);
+        }
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        let rules: ComplianceRules = env
+            .storage()
+            .instance()
+            .get(&DataKey::Rules)
+            .expect("rules must be set");
+        Self::write_policy_record(&env, rules, PolicyChangeKind::ImmediateRuleUpdate, comment);
+        env.events().publish((symbol_short!("pol_note"),), ());
     }
 
     /// Deterministic evaluation core.
@@ -1091,6 +1185,27 @@ impl ComplianceEngine {
         }
     }
 
+    pub fn update_holder_since(env: Env, addr: Address, holder_since: i64) {
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        if holder_since <= 0 {
+            panic_with_error!(env, ComplianceError::InvalidHolderSince);
+        }
+        let key = DataKey::HolderSince(addr.clone());
+        let is_new = !env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &(holder_since as u64));
+        env.storage().persistent().extend_ttl(&key, THRESHOLD, BUMP);
+        if is_new {
+            let c: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::HolderCount)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::HolderCount, &(c + 1));
+        }
+    }
+
     pub fn unregister_holder(env: Env, addr: Address) {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let key = DataKey::HolderSince(addr.clone());
@@ -1221,6 +1336,16 @@ impl ComplianceEngine {
 
     pub fn set_tier_policy(env: Env, from_tier: u32, to_tier: u32, policy: TierPolicy) {
         Self::require_admin(&env);
+        // A negative max_transfer_amount is nonsensical: the amount check in
+        // `evaluate_transfer_inner` uses `> 0` as the "enabled" sentinel, so a
+        // negative value would be stored silently but never trigger a denial,
+        // effectively disabling the cap in a misleading way.
+        if policy.max_transfer_amount < 0 {
+            panic_with_error!(env, ComplianceError::NegativeTierTransferAmount);
+        }
+        if policy.min_from_tier > 100 || policy.min_to_tier > 100 {
+            panic_with_error!(env, ComplianceError::InvalidTierPolicy);
+        }
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let key = DataKey::TierPolicy(TierPolicyKey { from_tier, to_tier });
         let is_new = !env.storage().instance().has(&key);
@@ -1389,8 +1514,11 @@ impl ComplianceEngine {
     }
 
     pub fn migrate_schema(env: Env, to_version: u32, description: String) {
-        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         Self::require_admin(&env);
+        if description.is_empty() {
+            panic_with_error!(env, ComplianceError::EmptyDescription);
+        }
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         let current: u32 = env
             .storage()
             .instance()
@@ -1453,6 +1581,11 @@ impl ComplianceEngine {
                 .instance()
                 .get(&DataKey::HolderCount)
                 .unwrap_or(0);
+            // Reject any cap that would be immediately violated by the live
+            // holder count.  The boundary condition `max_holders == count` is
+            // intentionally allowed: it prevents *new* holders from joining
+            // while leaving existing holders unaffected.  Only strictly less
+            // than is an impossible state.
             if rules.max_holders < count {
                 panic_with_error!(env, ComplianceError::MaxHoldersBelowCurrentCount);
             }
@@ -1534,17 +1667,68 @@ impl ComplianceEngine {
     }
 
     /// Single write path for policy history.  Every ruleset mutation calls this.
-    fn append_policy_record(
+    fn write_policy_record(
         env: &Env,
         rules: ComplianceRules,
         change_kind: PolicyChangeKind,
         description: String,
     ) {
+        let description = if description.is_empty() {
+            match change_kind {
+                PolicyChangeKind::ImmediateRuleUpdate => {
+                    String::from_str(env, "Immediate rule update")
+                }
+                PolicyChangeKind::DelayedRuleActivation => {
+                    String::from_str(env, "Delayed rule activation")
+                }
+                PolicyChangeKind::Pause => String::from_str(env, "Compliance paused"),
+                PolicyChangeKind::Unpause => String::from_str(env, "Compliance unpaused"),
+                PolicyChangeKind::BlocklistAdd => {
+                    String::from_str(env, "Address added to blocklist")
+                }
+                PolicyChangeKind::BlocklistRemove => {
+                    String::from_str(env, "Address removed from blocklist")
+                }
+                PolicyChangeKind::AllowlistAdd => {
+                    String::from_str(env, "Address added to allowlist")
+                }
+                PolicyChangeKind::AllowlistRemove => {
+                    String::from_str(env, "Address removed from allowlist")
+                }
+            }
+        } else {
+            description
+        };
         let count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::PolicyVersionCount)
             .unwrap_or(0);
+        // Collapse repeated writes of an identical state transition so the audit
+        // trail only records real policy changes.  List add/remove records do not
+        // carry the affected address, so identical-looking entries there can be
+        // distinct events and are always kept.
+        let dedupable = matches!(
+            change_kind,
+            PolicyChangeKind::ImmediateRuleUpdate
+                | PolicyChangeKind::DelayedRuleActivation
+                | PolicyChangeKind::Pause
+                | PolicyChangeKind::Unpause
+        );
+        if dedupable && count > 0 {
+            let last: Option<PolicyRecord> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PolicyVersion(count - 1));
+            if let Some(last) = last {
+                if last.rules == rules
+                    && last.change_kind == change_kind
+                    && last.description == description
+                {
+                    return;
+                }
+            }
+        }
         let rec = PolicyRecord {
             version: count,
             activation_timestamp: env.ledger().timestamp(),

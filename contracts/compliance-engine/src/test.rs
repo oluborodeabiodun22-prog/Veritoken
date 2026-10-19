@@ -2,16 +2,22 @@
 
 use crate::{
     ComplianceEngine, ComplianceEngineClient, ComplianceError, ComplianceRules, PolicyChangeKind,
+    TierPolicy,
 };
 use kyc_registry::{KycRegistry, KycRegistryClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, Env, Error, String,
+    symbol_short,
+    testutils::{Address as _, Events as _, Ledger},
+    Address, Env, Error, String, Symbol, TryFromVal,
 };
 
 // ── Shared setup helpers ──────────────────────────────────────────────────────
 
 fn setup() -> (Env, ComplianceEngineClient<'static>, Address) {
+    setup_with_delay(0)
+}
+
+fn setup_with_delay(delay: u64) -> (Env, ComplianceEngineClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
@@ -19,7 +25,7 @@ fn setup() -> (Env, ComplianceEngineClient<'static>, Address) {
     KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
     let ce_id = env.register(ComplianceEngine, ());
     let ce = ComplianceEngineClient::new(&env, &ce_id);
-    ce.initialize(&admin, &kyc_id, &0u64);
+    ce.initialize(&admin, &kyc_id, &delay);
     (env, ce, admin)
 }
 
@@ -54,6 +60,24 @@ fn rules(max: i128, min_hold: u64, max_hold_cnt: u32, paused: bool) -> Complianc
         allowlist_mode: false,
         max_holding_period: 0,
     }
+}
+
+fn blocked_event_count(env: &Env) -> usize {
+    let blocked = symbol_short!("blocked");
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|topic| {
+                    Symbol::try_from_val(env, &topic)
+                        .map(|s| s == blocked)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 // ── Basic transfer / pause / blocklist (preserved from original suite) ─────────
@@ -115,6 +139,30 @@ fn test_min_holding_period() {
 }
 
 #[test]
+fn test_update_holder_since_rejects_negative_timestamp() {
+    let (env, ce, _) = setup();
+    let holder = Address::generate(&env);
+
+    assert_eq!(
+        ce.try_update_holder_since(&holder, &-1),
+        Err(Ok(Error::from(ComplianceError::InvalidHolderSince)))
+    );
+    assert!(!ce.lockup_status(&holder).is_holder);
+}
+
+#[test]
+fn test_update_holder_since_rejects_zero_timestamp() {
+    let (env, ce, _) = setup();
+    let holder = Address::generate(&env);
+
+    assert_eq!(
+        ce.try_update_holder_since(&holder, &0),
+        Err(Ok(Error::from(ComplianceError::InvalidHolderSince)))
+    );
+    assert!(!ce.lockup_status(&holder).is_holder);
+}
+
+#[test]
 fn test_max_holders_blocks_new_but_allows_existing() {
     let (env, ce, _) = setup();
     let h1 = Address::generate(&env);
@@ -125,6 +173,40 @@ fn test_max_holders_blocks_new_but_allows_existing() {
     ce.register_holder(&h2);
     assert!(!ce.can_transfer(&h1, &new, &1));
     assert!(ce.can_transfer(&h1, &h2, &1));
+}
+
+#[test]
+fn test_max_holders_final_slot_transition() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let last_holder = Address::generate(&env);
+    let excess_holder = Address::generate(&env);
+    for address in [&sender, &last_holder, &excess_holder] {
+        kyc.approve(&verifier, address, &1, &0, &String::from_str(&env, "US"));
+    }
+    ce.set_rules(&rules(0, 0, 2, false));
+    ce.register_holder(&sender);
+    assert_eq!(ce.holder_count(), 1);
+    assert_eq!(
+        ce.evaluate_transfer(&sender, &last_holder, &1),
+        TransferDecision::Allow
+    );
+    // Evaluation is read-only; registration records the successful transfer's recipient.
+    assert_eq!(ce.holder_count(), 1);
+    ce.register_holder(&last_holder);
+    assert_eq!(ce.holder_count(), 2);
+    assert_eq!(
+        ce.evaluate_transfer(&sender, &excess_holder, &1),
+        TransferDecision::Deny(DenyReason::MaxHoldersReached)
+    );
+    assert!(!ce.lockup_status(&excess_holder).is_holder);
+    assert_eq!(
+        ce.evaluate_transfer(&sender, &last_holder, &1),
+        TransferDecision::Allow
+    );
+    ce.register_holder(&last_holder);
+    assert_eq!(ce.holder_count(), 2);
 }
 
 // ── Validation errors ─────────────────────────────────────────────────────────
@@ -170,6 +252,16 @@ fn test_set_rules_rejects_negative_max_transfer() {
         ce.try_set_rules(&rules(-1, 0, 0, false)),
         Err(Ok(Error::from(ComplianceError::NegativeMaxTransferAmount)))
     );
+}
+
+#[test]
+fn test_set_rules_accepts_zero_holding_periods() {
+    let (_, ce, _) = setup();
+    let configured = rules(0, 0, 0, false);
+    ce.set_rules(&configured);
+    let stored = ce.get_rules();
+    assert_eq!(stored.min_holding_period, 0);
+    assert_eq!(stored.max_holding_period, 0);
 }
 
 #[test]
@@ -236,19 +328,19 @@ fn test_activate_rules_fails_when_no_proposal_pending() {
 }
 
 #[test]
-fn test_propose_zero_delay_activates_immediately() {
-    let (env, ce, _) = setup(); // delay=0 by default in setup()
-    let r = ComplianceRules {
-        max_transfer_amount: 999,
-        min_holding_period: 0,
-        max_holders: 0,
-        require_same_jurisdiction: false,
-        paused: false,
-        allowlist_mode: false,
-        max_holding_period: 0,
-    };
-    ce.propose_rules(&r, &String::from_str(&env, "imm"));
-    ce.activate_rules(); // should not fail
+fn test_initialize_accepts_zero_rule_change_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycRegistry, ());
+    KycRegistryClient::new(&env, &kyc_id).initialize(&admin);
+    let ce_id = env.register(ComplianceEngine, ());
+    let ce = ComplianceEngineClient::new(&env, &ce_id);
+    ce.initialize(&admin, &kyc_id, &0u64);
+    ce.propose_rules(&rules(999, 0, 0, false), &String::from_str(&env, "imm"));
+    let proposal = ce.get_pending_proposal().unwrap();
+    assert_eq!(proposal.activate_at, 0);
+    ce.activate_rules();
     assert_eq!(ce.get_rules().max_transfer_amount, 999);
 }
 
@@ -291,6 +383,24 @@ fn test_set_rules_increments_policy_version() {
     let v = ce.get_policy_version(&1);
     assert_eq!(v.change_kind, PolicyChangeKind::ImmediateRuleUpdate);
     assert_eq!(v.rules.max_transfer_amount, 100);
+}
+
+#[test]
+fn test_identical_policy_writes_are_collapsed() {
+    let (_, ce, _) = setup();
+    ce.set_rules(&rules(100, 0, 0, false));
+    ce.set_rules(&rules(100, 0, 0, false));
+    ce.pause();
+    ce.pause();
+    // init + one rule update + one pause; the repeats add no records.
+    assert_eq!(ce.policy_version_count(), 3);
+    assert_eq!(
+        ce.get_current_policy_version().change_kind,
+        PolicyChangeKind::Pause
+    );
+    // A different state transition is still recorded.
+    ce.set_rules(&rules(200, 0, 0, false));
+    assert_eq!(ce.policy_version_count(), 4);
 }
 
 #[test]
@@ -347,13 +457,15 @@ fn test_blocklist_remove_creates_blocklist_remove_version() {
 }
 
 #[test]
-fn test_duplicate_blocklist_add_does_not_create_version() {
+fn test_duplicate_blocklist_add_is_noop() {
     let (env, ce, _) = setup();
     let addr = Address::generate(&env);
     ce.add_to_blocklist(&addr);
-    let count = ce.policy_version_count();
-    ce.add_to_blocklist(&addr); // already in list — no new version
-    assert_eq!(ce.policy_version_count(), count);
+    assert_eq!(blocked_event_count(&env), 1);
+    let policy_versions = ce.policy_version_count();
+    ce.add_to_blocklist(&addr);
+    assert_eq!(blocked_event_count(&env), 0);
+    assert_eq!(ce.policy_version_count(), policy_versions);
 }
 
 #[test]
@@ -575,6 +687,169 @@ fn test_activate_rules_one_second_before_boundary_fails() {
 // ── evaluate_transfer / KYC integration (preserved + extended) ────────────────
 
 #[test]
+fn test_evaluate_transfer_min_holding_period_boundary() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    ce.set_rules(&rules(0, 10, 0, false));
+    env.ledger().set_timestamp(1_000);
+    ce.register_holder(&from);
+
+    // The minimum release timestamp is inclusive: transfers unlock at equality.
+    for (timestamp, expected) in [
+        (
+            1_009,
+            TransferDecision::Deny(DenyReason::HoldingPeriodNotMet),
+        ),
+        (1_010, TransferDecision::Allow),
+        (1_011, TransferDecision::Allow),
+    ] {
+        env.ledger().set_timestamp(timestamp);
+        assert_eq!(ce.evaluate_transfer(&from, &to, &1), expected);
+        let status = ce.lockup_status(&from);
+        assert_eq!(status.holder_since, 1_000);
+        assert_eq!(status.min_release_at, 1_010);
+        assert_eq!(status.locked, timestamp < 1_010);
+        assert_eq!(
+            status.seconds_until_unlock,
+            1_010u64.saturating_sub(timestamp)
+        );
+    }
+}
+
+#[test]
+fn test_evaluate_transfer_zero_min_holding_period_allows_immediately() {
+    use crate::TransferDecision;
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    ce.set_rules(&rules(0, 0, 0, false));
+    env.ledger().set_timestamp(1_000);
+    ce.register_holder(&from);
+    assert_eq!(
+        ce.evaluate_transfer(&from, &to, &1),
+        TransferDecision::Allow
+    );
+    let status = ce.lockup_status(&from);
+    assert_eq!(status.min_release_at, 0);
+    assert!(!status.locked);
+    assert_eq!(status.seconds_until_unlock, 0);
+}
+
+#[test]
+fn test_evaluate_transfer_max_holding_period_boundary() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    let mut configured = rules(0, 0, 0, false);
+    configured.max_holding_period = 10;
+    ce.set_rules(&configured);
+    env.ledger().set_timestamp(1_000);
+    ce.register_holder(&to);
+
+    // The existing maximum policy rejects incoming transfers at and after
+    // the recipient's deadline; it does not impose a minimum lock.
+    for (timestamp, expected) in [
+        (1_009, TransferDecision::Allow),
+        (
+            1_010,
+            TransferDecision::Deny(DenyReason::RecipientHoldingPeriodExceeded),
+        ),
+        (
+            1_011,
+            TransferDecision::Deny(DenyReason::RecipientHoldingPeriodExceeded),
+        ),
+    ] {
+        env.ledger().set_timestamp(timestamp);
+        assert_eq!(ce.evaluate_transfer(&from, &to, &1), expected);
+        let status = ce.lockup_status(&to);
+        assert!(status.is_holder);
+        assert_eq!(status.holder_since, 1_000);
+        assert_eq!(status.min_holding_period, 0);
+        assert_eq!(status.max_holding_period, 10);
+        assert_eq!(status.min_release_at, 0);
+        assert_eq!(status.max_release_at, 1_010);
+        assert!(!status.locked);
+        assert_eq!(status.seconds_until_unlock, 0);
+    }
+}
+
+#[test]
+fn test_evaluate_transfer_allowlist_endpoint_combinations() {
+    use crate::{DenyReason, TransferDecision};
+    for (allow_from, allow_to, expected) in [
+        (
+            false,
+            false,
+            TransferDecision::Deny(DenyReason::FromNotAllowlisted),
+        ),
+        (
+            true,
+            false,
+            TransferDecision::Deny(DenyReason::ToNotAllowlisted),
+        ),
+        (
+            false,
+            true,
+            TransferDecision::Deny(DenyReason::FromNotAllowlisted),
+        ),
+        (true, true, TransferDecision::Allow),
+    ] {
+        let (env, ce, kyc, verifier, _) = setup_with_kyc();
+        let from = Address::generate(&env);
+        let to = Address::generate(&env);
+        for address in [&from, &to] {
+            kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+        }
+        let mut configured = rules(0, 0, 0, false);
+        configured.allowlist_mode = true;
+        ce.set_rules(&configured);
+        if allow_from {
+            ce.add_to_allowlist(&from);
+        }
+        if allow_to {
+            ce.add_to_allowlist(&to);
+        }
+        assert_eq!(
+            ce.evaluate_transfer(&from, &to, &1),
+            expected,
+            "sender allowed: {allow_from}, recipient allowed: {allow_to}"
+        );
+    }
+}
+
+#[test]
+fn test_evaluate_transfer_blocklisted_to_denied() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    for address in [&from, &to] {
+        kyc.approve(&verifier, address, &0, &0, &String::from_str(&env, "US"));
+    }
+    assert_eq!(
+        ce.evaluate_transfer(&from, &to, &1),
+        TransferDecision::Allow
+    );
+    ce.add_to_blocklist(&to);
+    assert_eq!(
+        ce.evaluate_transfer(&from, &to, &1),
+        TransferDecision::Deny(DenyReason::ToBlocklisted)
+    );
+}
+
+#[test]
 fn test_evaluate_transfer_approved_kyc_allow() {
     use crate::TransferDecision;
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
@@ -684,7 +959,7 @@ fn test_can_transfer_ignores_kyc_for_backward_compat() {
 }
 
 #[test]
-fn test_evaluate_transfer_amount_exceeded() {
+fn test_evaluate_transfer_maximum_is_inclusive() {
     use crate::{DenyReason, TransferDecision};
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
     let alice = Address::generate(&env);
@@ -700,6 +975,11 @@ fn test_evaluate_transfer_amount_exceeded() {
         allowlist_mode: false,
         max_holding_period: 0,
     });
+    // The cap is inclusive; one smallest unit above it is denied.
+    assert_eq!(
+        ce.evaluate_transfer(&alice, &bob, &500),
+        TransferDecision::Allow
+    );
     assert_eq!(
         ce.evaluate_transfer(&alice, &bob, &501),
         TransferDecision::Deny(DenyReason::AmountExceeded)
@@ -786,7 +1066,6 @@ fn test_max_holding_period_zero_means_unlimited() {
 
 #[test]
 fn test_tier_policy_blocked_pair() {
-    use crate::TierPolicy;
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -808,7 +1087,6 @@ fn test_tier_policy_blocked_pair() {
 
 #[test]
 fn test_tier_policy_exact_match_overrides_wildcard() {
-    use crate::TierPolicy;
     let (env, ce, kyc, verifier, _) = setup_with_kyc();
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
@@ -837,7 +1115,127 @@ fn test_tier_policy_exact_match_overrides_wildcard() {
     assert!(ce.can_transfer(&alice, &bob, &100));
 }
 
+#[test]
+fn test_tier_policy_amount_cap_boundaries() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    kyc.approve(&verifier, &sender, &1, &0, &String::from_str(&env, "US"));
+    kyc.approve(&verifier, &recipient, &2, &0, &String::from_str(&env, "US"));
+    ce.set_rules(&rules(1_000, 0, 0, false));
+    ce.set_tier_policy(
+        &1,
+        &2,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 100,
+            min_from_tier: 1,
+            min_to_tier: 2,
+        },
+    );
+    for (amount, expected) in [
+        (100, TransferDecision::Allow),
+        (101, TransferDecision::Deny(DenyReason::TierAmountExceeded)),
+    ] {
+        assert_eq!(ce.evaluate_transfer(&sender, &recipient, &amount), expected);
+        assert_eq!(
+            ce.evaluate_transfer(&recipient, &sender, &amount),
+            TransferDecision::Allow
+        );
+    }
+    assert_eq!(ce.tier_policy_count(), 1);
+    assert_eq!(ce.get_tier_policy(&1, &2).unwrap().max_transfer_amount, 100);
+    assert!(ce.get_tier_policy(&2, &1).is_none());
+}
+
+#[test]
+fn test_blocked_tier_policy_precedes_tier_amount_check() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    kyc.approve(&verifier, &sender, &1, &0, &String::from_str(&env, "US"));
+    kyc.approve(&verifier, &recipient, &2, &0, &String::from_str(&env, "US"));
+    ce.set_rules(&rules(1_000, 0, 0, false));
+    ce.set_tier_policy(
+        &1,
+        &2,
+        &TierPolicy {
+            blocked: true,
+            max_transfer_amount: 100,
+            min_from_tier: 1,
+            min_to_tier: 2,
+        },
+    );
+    for amount in [1, 100, 101] {
+        assert_eq!(
+            ce.evaluate_transfer(&sender, &recipient, &amount),
+            TransferDecision::Deny(DenyReason::TierPolicyBlocked)
+        );
+        assert_eq!(
+            ce.evaluate_transfer(&recipient, &sender, &amount),
+            TransferDecision::Allow
+        );
+    }
+}
+
 // ── Risk scoring tests (preserved) ───────────────────────────────────────────
+
+#[test]
+fn test_risk_default_score_boundaries_for_unscored_addresses() {
+    use crate::{DenyReason, RiskConfig, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let jurisdiction = String::from_str(&env, "US");
+    for address in [&sender, &recipient] {
+        kyc.approve(&verifier, address, &1, &0, &jurisdiction);
+    }
+    assert!(ce.get_jurisdiction_risk_score(&jurisdiction).is_none());
+    // The threshold may be below the default; only scores above 100 are invalid.
+    for (max_score, default_score) in [(50, 0), (50, 50), (50, 51), (100, 100)] {
+        ce.set_risk_config(&RiskConfig {
+            max_score,
+            default_score,
+        });
+        let stored = ce.get_risk_config().unwrap();
+        assert_eq!(stored.max_score, max_score);
+        assert_eq!(stored.default_score, default_score);
+        let denied = default_score > max_score;
+        assert_eq!(
+            ce.evaluate_transfer_risk(&jurisdiction, &jurisdiction),
+            (default_score, default_score, denied)
+        );
+        assert_eq!(
+            ce.evaluate_transfer(&sender, &recipient, &1),
+            if denied {
+                TransferDecision::Deny(DenyReason::RiskScoreTooHigh)
+            } else {
+                TransferDecision::Allow
+            }
+        );
+    }
+    for (max_score, default_score) in [(100, 101), (101, 0)] {
+        assert_eq!(
+            ce.try_set_risk_config(&RiskConfig {
+                max_score,
+                default_score
+            }),
+            Err(Ok(Error::from(ComplianceError::InvalidRiskConfig)))
+        );
+        let stored = ce.get_risk_config().unwrap();
+        assert_eq!((stored.max_score, stored.default_score), (100, 100));
+        assert_eq!(
+            ce.evaluate_transfer_risk(&jurisdiction, &jurisdiction),
+            (100, 100, false)
+        );
+        assert_eq!(
+            ce.evaluate_transfer(&sender, &recipient, &1),
+            TransferDecision::Allow
+        );
+    }
+}
 
 #[test]
 fn test_risk_scoring_inactive_by_default() {
@@ -1273,12 +1671,516 @@ fn test_migration_v2_records_migration_audit_entry() {
 fn test_blocklist_and_allowlist_independent() {
     let (env, ce, _) = setup();
     let addr = Address::generate(&env);
-    ce.add_to_blocklist(&addr);
+    // Allowlist first: adding an already-blocklisted address is rejected.
     ce.add_to_allowlist(&addr);
-    // Same address can be in both lists simultaneously
+    ce.add_to_blocklist(&addr);
+    // A subsequent blocklist entry does not remove the allowlist entry.
     assert!(ce.is_blocklisted(&addr));
     assert!(ce.is_allowlisted(&addr));
     ce.remove_from_blocklist(&addr);
     assert!(!ce.is_blocklisted(&addr));
     assert!(ce.is_allowlisted(&addr));
+}
+
+// ── Regression tests for targeted validation fixes ────────────────────────────
+
+// Fix 1 — add_to_allowlist: reject blocklisted address
+// Before the fix, an address already on the blocklist could also be added to
+// the allowlist.  The blocklist check in evaluate_transfer_inner always runs
+// first, so the allowlist entry would never have any effect — but it would
+// still consume persistent storage and write a misleading AllowlistAdd policy
+// record.  The fix panics with BlocklistedAddressOnAllowlist before touching
+// storage, keeping both lists mutually exclusive.
+#[test]
+fn test_add_to_allowlist_rejects_blocklisted_address() {
+    let (env, ce, _) = setup();
+    let addr = Address::generate(&env);
+
+    // Put the address on the blocklist first.
+    ce.add_to_blocklist(&addr);
+    assert!(ce.is_blocklisted(&addr));
+
+    // Attempting to allowlist the same address must be rejected.
+    assert_eq!(
+        ce.try_add_to_allowlist(&addr),
+        Err(Ok(Error::from(
+            ComplianceError::BlocklistedAddressOnAllowlist
+        )))
+    );
+
+    // Storage must be untouched: no allowlist entry written, count stays 0.
+    assert!(!ce.is_allowlisted(&addr));
+    assert_eq!(ce.allowlist_count(), 0);
+
+    // Normal path still works: a non-blocklisted address can be allowlisted.
+    let other = Address::generate(&env);
+    ce.add_to_allowlist(&other);
+    assert!(ce.is_allowlisted(&other));
+    assert_eq!(ce.allowlist_count(), 1);
+}
+
+// Fix 2 — set_tier_policy: reject negative max_transfer_amount
+// Before the fix, a TierPolicy with a negative max_transfer_amount could be
+// stored.  The enforcement check in evaluate_transfer_inner uses `> 0` as the
+// "cap is enabled" sentinel, so a negative value would be stored silently but
+// never trip the denial branch — effectively disabling the cap while looking
+// like it was set.  The fix panics with NegativeTierTransferAmount before any
+// state is written.
+#[test]
+fn test_set_tier_policy_rejects_negative_max_transfer_amount() {
+    let (_, ce, _) = setup();
+
+    // Negative cap must be rejected before storage is touched.
+    assert_eq!(
+        ce.try_set_tier_policy(
+            &0u32,
+            &1u32,
+            &TierPolicy {
+                blocked: false,
+                max_transfer_amount: -1,
+                min_from_tier: 0,
+                min_to_tier: 0,
+            }
+        ),
+        Err(Ok(Error::from(ComplianceError::NegativeTierTransferAmount)))
+    );
+
+    // No policy must have been written.
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_none());
+    assert_eq!(ce.tier_policy_count(), 0);
+
+    // Normal path: zero and positive amounts are both accepted.
+    ce.set_tier_policy(
+        &0u32,
+        &1u32,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 0,
+            min_from_tier: 0,
+            min_to_tier: 0,
+        },
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_some());
+
+    ce.set_tier_policy(
+        &0u32,
+        &2u32,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 1_000,
+            min_from_tier: 0,
+            min_to_tier: 0,
+        },
+    );
+    assert!(ce.get_tier_policy(&0u32, &2u32).is_some());
+}
+
+#[test]
+fn test_set_tier_policy_rejects_invalid_min_tiers() {
+    let (_, ce, _) = setup();
+
+    assert_eq!(
+        ce.try_set_tier_policy(
+            &0u32,
+            &1u32,
+            &TierPolicy {
+                blocked: false,
+                max_transfer_amount: 0,
+                min_from_tier: 101,
+                min_to_tier: 0,
+            }
+        ),
+        Err(Ok(Error::from(ComplianceError::InvalidTierPolicy)))
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_none());
+
+    assert_eq!(
+        ce.try_set_tier_policy(
+            &0u32,
+            &1u32,
+            &TierPolicy {
+                blocked: false,
+                max_transfer_amount: 0,
+                min_from_tier: 0,
+                min_to_tier: 101,
+            }
+        ),
+        Err(Ok(Error::from(ComplianceError::InvalidTierPolicy)))
+    );
+    assert_eq!(ce.tier_policy_count(), 0);
+}
+
+// Fix — set_tier_policy: reject min_from_tier above supported range (#849)
+// A min_from_tier value above 100 is outside the valid tier range and was
+// previously stored silently, making the from-tier enforcement check
+// unpredictable for any address whose tier is within the normal range.
+// The fix rejects it with InvalidTierPolicy before state is written.
+#[test]
+fn test_set_tier_policy_rejects_min_from_tier_above_range() {
+    let (_, ce, _) = setup();
+
+    // min_from_tier = 101 is above the valid range [0, 100] — must be rejected.
+    assert_eq!(
+        ce.try_set_tier_policy(
+            &0u32,
+            &1u32,
+            &TierPolicy {
+                blocked: false,
+                max_transfer_amount: 0,
+                min_from_tier: 101,
+                min_to_tier: 0,
+            }
+        ),
+        Err(Ok(Error::from(ComplianceError::InvalidTierPolicy)))
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_none());
+
+    // Normal path: min_from_tier at the boundary value 100 must be accepted.
+    ce.set_tier_policy(
+        &0u32,
+        &1u32,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 0,
+            min_from_tier: 100,
+            min_to_tier: 0,
+        },
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_some());
+}
+
+// Fix — set_tier_policy: reject min_to_tier above supported range (#848)
+// A min_to_tier value above 100 is outside the valid tier range and was
+// previously stored silently, making the to-tier enforcement check produce
+// confusing compliance decisions for in-range recipients.
+// The fix rejects it with InvalidTierPolicy before state is written.
+#[test]
+fn test_set_tier_policy_rejects_min_to_tier_above_range() {
+    let (_, ce, _) = setup();
+
+    // min_to_tier = 101 is above the valid range [0, 100] — must be rejected.
+    assert_eq!(
+        ce.try_set_tier_policy(
+            &0u32,
+            &1u32,
+            &TierPolicy {
+                blocked: false,
+                max_transfer_amount: 0,
+                min_from_tier: 0,
+                min_to_tier: 101,
+            }
+        ),
+        Err(Ok(Error::from(ComplianceError::InvalidTierPolicy)))
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_none());
+
+    // Normal path: min_to_tier at the boundary value 100 must be accepted.
+    ce.set_tier_policy(
+        &0u32,
+        &1u32,
+        &TierPolicy {
+            blocked: false,
+            max_transfer_amount: 0,
+            min_from_tier: 0,
+            min_to_tier: 100,
+        },
+    );
+    assert!(ce.get_tier_policy(&0u32, &1u32).is_some());
+}
+
+#[test]
+fn test_policy_records_normalize_empty_descriptions() {
+    let (env, ce, _) = setup();
+    ce.set_rules(&rules(42, 0, 0, false));
+
+    let record = ce.get_current_policy_version();
+    assert_eq!(record.change_kind, PolicyChangeKind::ImmediateRuleUpdate);
+    assert_eq!(
+        record.description,
+        String::from_str(&env, "Immediate rule update")
+    );
+}
+
+// Fix 3 — validate_rules: max_holders boundary
+// The guard rejects max_holders strictly less than the live holder count.
+// The exact-equal boundary (max_holders == holder_count) must be accepted:
+// it prevents new holders from joining but does not break existing ones.
+// This test makes both the rejected and the accepted boundary explicit.
+#[test]
+fn test_validate_rules_max_holders_boundary() {
+    let (env, ce, _) = setup();
+
+    // Register exactly 2 holders.
+    ce.register_holder(&Address::generate(&env));
+    ce.register_holder(&Address::generate(&env));
+    assert_eq!(ce.holder_count(), 2);
+
+    // max_holders < holder_count (1 < 2) → must be rejected.
+    assert_eq!(
+        ce.try_set_rules(&rules(0, 0, 1, false)),
+        Err(Ok(Error::from(
+            ComplianceError::MaxHoldersBelowCurrentCount
+        )))
+    );
+
+    // max_holders == holder_count (2 == 2) → must be accepted (freeze at current).
+    ce.set_rules(&rules(0, 0, 2, false));
+    assert_eq!(ce.get_rules().max_holders, 2);
+
+    // max_holders > holder_count (3 > 2) → must be accepted.
+    ce.set_rules(&rules(0, 0, 3, false));
+    assert_eq!(ce.get_rules().max_holders, 3);
+}
+
+// Fix 4 — propose_rules: reject empty description
+// Before the fix, propose_rules accepted an empty description string and
+// stored it into PendingRulesProposal and eventually into a PolicyRecord,
+// leaving the governance audit trail with meaningless blank entries.
+// The fix panics with EmptyDescription before any state is written.
+#[test]
+fn test_propose_rules_rejects_empty_description() {
+    let (env, ce, _) = setup();
+    let empty = String::from_str(&env, "");
+
+    // Empty string must be rejected — no proposal stored.
+    assert_eq!(
+        ce.try_propose_rules(&rules(0, 0, 0, false), &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyDescription)))
+    );
+    assert!(ce.get_pending_proposal().is_none());
+
+    // Normal path: non-empty description must still be accepted.
+    let desc = String::from_str(&env, "raise transfer cap for Q4");
+    ce.propose_rules(&rules(0, 0, 0, false), &desc);
+    let proposal = ce.get_pending_proposal().expect("proposal must be stored");
+    assert_eq!(proposal.description, desc);
+}
+
+// Fix #844 — deny_transfer: reject empty evaluation reasons
+// Before the fix, deny_transfer did not exist at all, making it impossible to
+// manually log a transfer denial with a traceable reason.  Without an explicit
+// reason the compliance audit trail cannot support post-facto debugging or
+// review of why a specific transfer was refused.
+// The new function requires a non-empty reason string and panics with
+// EmptyEvaluationReason before any state is written when the string is empty.
+#[test]
+fn test_deny_transfer_rejects_empty_reason() {
+    let (env, ce, _) = setup();
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    let empty = String::from_str(&env, "");
+
+    // Empty reason must be rejected — no event emitted, no state written.
+    assert_eq!(
+        ce.try_deny_transfer(&from, &to, &100, &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyEvaluationReason)))
+    );
+
+    // Normal path: non-empty reason must succeed and emit a deny_xfr event.
+    let reason = String::from_str(
+        &env,
+        "blocklisted jurisdiction flagged by compliance officer",
+    );
+    ce.deny_transfer(&from, &to, &100, &reason);
+}
+
+// Fix #846 — append_policy_record: reject empty governance comments
+// Before the fix, there was no public append_policy_record entry point.
+// Blank governance comments would have had to be stored through internal
+// paths, making the policy history hard to interpret.
+// The new public function requires a non-empty comment and panics with
+// EmptyGovernanceComment before any state is written when the string is empty.
+#[test]
+fn test_append_policy_record_rejects_empty_comment() {
+    let (env, ce, _) = setup();
+    let empty = String::from_str(&env, "");
+
+    // Empty governance comment must be rejected — policy version count unchanged.
+    let before = ce.policy_version_count();
+    assert_eq!(
+        ce.try_append_policy_record(&empty),
+        Err(Ok(Error::from(ComplianceError::EmptyGovernanceComment)))
+    );
+    assert_eq!(ce.policy_version_count(), before);
+
+    // Normal path: non-empty comment must succeed and add a new policy version.
+    let comment = String::from_str(&env, "quarterly review — no rule changes required");
+    ce.append_policy_record(&comment);
+    assert_eq!(ce.policy_version_count(), before + 1);
+    let record = ce.get_current_policy_version();
+    assert_eq!(record.description, comment);
+}
+
+// #911: both endpoint orderings must produce the same mismatch reason.
+#[test]
+fn test_same_jurisdiction_symmetry() {
+    use crate::{DenyReason, TransferDecision};
+    let (env, ce, kyc, verifier, _) = setup_with_kyc();
+    let us = Address::generate(&env);
+    let gb = Address::generate(&env);
+    let other_us = Address::generate(&env);
+    for (address, jurisdiction) in [(&us, "US"), (&gb, "GB"), (&other_us, "US")] {
+        kyc.approve(
+            &verifier,
+            address,
+            &1,
+            &0,
+            &String::from_str(&env, jurisdiction),
+        );
+    }
+    let mut policy = rules(0, 0, 0, false);
+    policy.require_same_jurisdiction = true;
+    ce.set_rules(&policy);
+    for (from, to) in [(&us, &gb), (&gb, &us)] {
+        assert_eq!(
+            ce.evaluate_transfer(from, to, &100),
+            TransferDecision::Deny(DenyReason::SameJurisdictionRequired)
+        );
+        assert!(!ce.can_transfer(from, to, &100));
+    }
+    for (from, to) in [(&us, &other_us), (&other_us, &us)] {
+        assert_eq!(
+            ce.evaluate_transfer(from, to, &100),
+            TransferDecision::Allow
+        );
+        assert!(ce.can_transfer(from, to, &100));
+    }
+}
+
+// #912: use a nonzero delay and the same proposal on both sides of the boundary.
+#[test]
+fn test_delayed_activation_before_and_at_deadline() {
+    let (env, ce, _) = setup_with_delay(10);
+    env.ledger().set_timestamp(1_000);
+    let original = ce.get_rules();
+    let history = ce.get_policy_history(&0, &20);
+    let proposed = rules(100, 0, 0, false);
+    let description = String::from_str(&env, "set transfer cap");
+    ce.propose_rules(&proposed, &description);
+    let pending = ce.get_pending_proposal().unwrap();
+    assert_eq!(pending.activate_at, 1_010);
+    env.ledger().set_timestamp(pending.activate_at - 1);
+    assert_eq!(
+        ce.try_activate_rules(),
+        Err(Ok(Error::from(ComplianceError::TooEarlyToActivate)))
+    );
+    assert_eq!(ce.get_rules(), original);
+    assert_eq!(ce.get_policy_history(&0, &20), history);
+    assert_eq!(ce.policy_version_count(), history.len());
+    let retained = ce.get_pending_proposal().unwrap();
+    assert_eq!(retained.rules, proposed);
+    assert_eq!(retained.description, description);
+    assert_eq!(retained.activate_at, pending.activate_at);
+    env.ledger().set_timestamp(pending.activate_at);
+    assert_eq!(ce.try_activate_rules(), Ok(Ok(())));
+    assert_eq!(ce.get_rules(), proposed);
+    assert!(ce.get_pending_proposal().is_none());
+    let updated = ce.get_policy_history(&0, &20);
+    assert_eq!(updated.len(), history.len() + 1);
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+    assert_eq!(updated.get(0), history.get(0));
+    let record = updated.last().unwrap();
+    assert_eq!(record.version, history.len());
+    assert_eq!(record.rules, proposed);
+    assert_eq!(record.description, description);
+    assert_eq!(record.activation_timestamp, pending.activate_at);
+    assert_eq!(record.change_kind, PolicyChangeKind::DelayedRuleActivation);
+}
+
+// #913: a replacement must reset the deadline and remove the stale proposal.
+#[test]
+fn test_replacement_proposal_activates_only_latest() {
+    let (env, ce, _) = setup_with_delay(10);
+    let original = ce.get_rules();
+    let history = ce.get_policy_history(&0, &20);
+    env.ledger().set_timestamp(1_000);
+    ce.propose_rules(&rules(100, 0, 0, false), &String::from_str(&env, "first"));
+    let first_deadline = ce.get_pending_proposal().unwrap().activate_at;
+    env.ledger().set_timestamp(1_005);
+    let latest = rules(200, 60, 0, false);
+    let description = String::from_str(&env, "corrected policy");
+    ce.propose_rules(&latest, &description);
+    let pending = ce.get_pending_proposal().unwrap();
+    assert_eq!(pending.rules, latest);
+    assert_eq!(pending.description, description);
+    assert_eq!(pending.activate_at, 1_015);
+    env.ledger().set_timestamp(first_deadline);
+    assert_eq!(
+        ce.try_activate_rules(),
+        Err(Ok(Error::from(ComplianceError::TooEarlyToActivate)))
+    );
+    assert_eq!(ce.get_rules(), original);
+    assert_eq!(ce.get_policy_history(&0, &20), history);
+    assert_eq!(ce.get_pending_proposal().unwrap().rules, latest);
+    env.ledger().set_timestamp(pending.activate_at);
+    ce.activate_rules();
+    assert_eq!(ce.get_rules(), latest);
+    assert!(ce.get_pending_proposal().is_none());
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+    let record = ce.get_current_policy_version();
+    assert_eq!(record.rules, latest);
+    assert_eq!(record.description, description);
+    assert_eq!(record.activation_timestamp, pending.activate_at);
+    assert_eq!(record.change_kind, PolicyChangeKind::DelayedRuleActivation);
+    let activated_history = ce.get_policy_history(&0, &20);
+    assert_eq!(
+        ce.try_activate_rules(),
+        Err(Ok(Error::from(ComplianceError::NoRulesPending)))
+    );
+    assert_eq!(ce.get_policy_history(&0, &20), activated_history);
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+}
+
+// #914: caller-supplied audit text occurs in these four public mutation paths.
+// deny_transfer uses an evaluation reason; migrate_schema has a separate audit log.
+#[test]
+fn test_empty_governance_descriptions_preserve_state() {
+    let (env, ce, _) = setup_with_delay(10);
+    let original = ce.get_rules();
+    let description = String::from_str(&env, "approved policy");
+    let proposed = rules(200, 0, 0, false);
+    ce.propose_rules(&proposed, &description);
+    let pending = ce.get_pending_proposal().unwrap();
+    let history = ce.get_policy_history(&0, &20);
+    let empty = String::from_str(&env, "");
+    assert_eq!(
+        ce.try_propose_rules(&rules(300, 0, 0, false), &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyDescription)))
+    );
+    assert_eq!(
+        ce.try_append_policy_record(&empty),
+        Err(Ok(Error::from(ComplianceError::EmptyGovernanceComment)))
+    );
+    assert_eq!(
+        ce.try_migrate_schema(&2, &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyDescription)))
+    );
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+    assert_eq!(
+        ce.try_deny_transfer(&from, &to, &1, &empty),
+        Err(Ok(Error::from(ComplianceError::EmptyEvaluationReason)))
+    );
+    assert_eq!(ce.get_rules(), original);
+    assert_eq!(ce.get_policy_history(&0, &20), history);
+    assert_eq!(ce.policy_version_count(), history.len());
+    assert_eq!(ce.schema_version(), 1);
+    assert_eq!(ce.migration_count(), 0);
+    let retained = ce.get_pending_proposal().unwrap();
+    assert_eq!(retained.rules, pending.rules);
+    assert_eq!(retained.description, pending.description);
+    assert_eq!(retained.activate_at, pending.activate_at);
+    ce.append_policy_record(&description);
+    assert_eq!(ce.policy_version_count(), history.len() + 1);
+    assert_eq!(ce.get_current_policy_version().description, description);
+    ce.migrate_schema(&2, &description);
+    assert_eq!(ce.schema_version(), 2);
+    assert_eq!(ce.migration_count(), 1);
+    assert_eq!(ce.get_migration_record(&0).description, description);
+    ce.deny_transfer(&from, &to, &1, &description);
+    env.ledger().set_timestamp(pending.activate_at);
+    ce.activate_rules();
+    assert_eq!(ce.get_rules(), proposed);
+    assert_eq!(ce.policy_version_count(), history.len() + 2);
+    assert_eq!(ce.get_current_policy_version().description, description);
 }

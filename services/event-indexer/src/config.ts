@@ -15,12 +15,12 @@
 
 import type { IndexerConfig, ContractConfig } from "./types.js";
 
-const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
-const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+export const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
+export const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
 
 function parseContracts(raw: string): ContractConfig[] {
   if (!raw.trim()) return [];
-  return raw
+  const contracts = raw
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean)
@@ -35,12 +35,53 @@ function parseContracts(raw: string): ContractConfig[] {
       };
     })
     .filter((c) => c.contractId.length > 0);
+
+  // Fix 3: reject blank labels
+  for (const c of contracts) {
+    if (c.label.length === 0) {
+      throw new Error(
+        `CONTRACT_IDS contains an entry with a blank label (contractId: "${c.contractId}")`
+      );
+    }
+  }
+
+  // Reject whitespace left inside a label or contract ID after trimming, so a
+  // malformed identifier (e.g. "rwa:CABC DEF") is never stored in the config.
+  for (const c of contracts) {
+    if (/\s/.test(c.label) || /\s/.test(c.contractId)) {
+      throw new Error(
+        `CONTRACT_IDS contains whitespace inside an entry (label: "${c.label}", contractId: "${c.contractId}")`
+      );
+    }
+  }
+
+  // Fix 4: reject duplicate labels and duplicate contract IDs
+  const seenLabels     = new Set<string>();
+  const seenContractIds = new Set<string>();
+  for (const c of contracts) {
+    if (seenLabels.has(c.label)) {
+      throw new Error(`CONTRACT_IDS contains a duplicate label: "${c.label}"`);
+    }
+    seenLabels.add(c.label);
+
+    if (seenContractIds.has(c.contractId)) {
+      throw new Error(`CONTRACT_IDS contains a duplicate contract ID: "${c.contractId}"`);
+    }
+    seenContractIds.add(c.contractId);
+  }
+
+  return contracts;
 }
 
 export function loadConfig(): IndexerConfig {
-  const rpcUrl = process.env.RPC_URL ?? process.env.STELLAR_RPC_URL;
+  // Fix 2: trim the RPC URL and reject a value that is blank after trimming
+  const rawRpcUrl = process.env.RPC_URL ?? process.env.STELLAR_RPC_URL;
+  const rpcUrl    = rawRpcUrl?.trim() ?? "";
   if (!rpcUrl) {
-    throw new Error("RPC_URL environment variable is required");
+    throw new Error(
+      "RPC_URL environment variable is required " +
+        "(checked RPC_URL, STELLAR_RPC_URL; both are unset or blank)"
+    );
   }
 
   const rawPassphrase = process.env.NETWORK_PASSPHRASE ?? process.env.STELLAR_NETWORK_PASSPHRASE;
@@ -56,8 +97,14 @@ export function loadConfig(): IndexerConfig {
   if (isNaN(pollIntervalMs) || pollIntervalMs <= 0) {
     throw new Error("POLL_INTERVAL_MS must be a positive integer");
   }
-  const port           = parseInt(process.env.PORT ?? "3001", 10);
-  const contracts      = parseContracts(process.env.CONTRACT_IDS ?? "");
+
+  // Fix 1: validate PORT is within the legal TCP range 1–65535
+  const port = parseInt(process.env.PORT ?? "3001", 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    throw new Error("PORT must be an integer between 1 and 65535");
+  }
+
+  const contracts = parseContracts(process.env.CONTRACT_IDS ?? "");
 
   return { rpcUrl, networkPassphrase, pollIntervalMs, contracts, port };
 }

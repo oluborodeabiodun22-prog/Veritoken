@@ -103,6 +103,56 @@ function sha256Hex(data: Buffer): string {
   return crypto.createHash("sha256").update(data).digest("hex");
 }
 
+/**
+ * Parse a comma-separated string of contract identifiers.
+ *
+ * Each entry is trimmed; empty entries (produced by trailing commas, double
+ * commas, or whitespace-only segments) are rejected by throwing an error.
+ * This prevents ambiguous manifests and upstream deployment failures that are
+ * hard to diagnose.
+ *
+ * @param raw - A comma-separated string of contract IDs, e.g. "kyc-registry,rwa-token".
+ * @returns   - An array of non-empty, trimmed contract ID strings.
+ * @throws    - If any entry is empty after trimming.
+ */
+export function parseContractIds(raw: string): string[] {
+  const entries = raw.split(",");
+  const result: string[] = [];
+  for (const entry of entries) {
+    const trimmed = entry.trim();
+    if (trimmed === "") {
+      throw new Error(
+        `parseContractIds: empty contract identifier in input "${raw}". ` +
+          "Remove trailing commas and blank entries before proceeding."
+      );
+    }
+    result.push(trimmed);
+  }
+  return result;
+}
+
+/**
+ * Parse a deployment config JSON string and validate contract entries.
+ *
+ * Every contract must have a non-empty `name`; blank names would otherwise be
+ * written into the deployment manifest as ambiguous keys.
+ *
+ * @param raw - The raw deployment config JSON.
+ * @returns   - The parsed deployment config.
+ * @throws    - If any contract name is missing, not a string, or blank.
+ */
+export function loadConfig(raw: string): DeployConfig {
+  const config: DeployConfig = JSON.parse(raw);
+  (config.contracts ?? []).forEach((contract, index) => {
+    if (typeof contract.name !== "string" || contract.name.trim() === "") {
+      throw new Error(
+        `loadConfig: contract at index ${index} must have a non-empty name.`
+      );
+    }
+  });
+  return config;
+}
+
 function resolveArtifactPath(artifactTemplate: string): string {
   const resolved = artifactTemplate.replace("${wasm_dir}", WASM_DIR);
   if (!fs.existsSync(resolved)) {
@@ -342,9 +392,7 @@ async function main(): Promise<void> {
   console.log(`Manifest out:   ${MANIFEST_OUT}`);
   console.log("");
 
-  const config: DeployConfig = JSON.parse(
-    fs.readFileSync(CONFIG_FILE, "utf8")
-  );
+  const config = loadConfig(fs.readFileSync(CONFIG_FILE, "utf8"));
 
   const keypair = Keypair.fromSecret(DEPLOYER_SECRET);
   const server = new SorobanRpc.Server(RPC_URL);

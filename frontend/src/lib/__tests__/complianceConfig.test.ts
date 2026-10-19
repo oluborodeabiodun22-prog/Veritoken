@@ -71,6 +71,20 @@ describe("exportConfig / configToRules round-trip", () => {
     }
   });
 
+  it("rejects malformed decimal strings before BigInt conversion", () => {
+    const exported = exportConfig(BASE_RULES, [], null, { label: "test", network: "testnet" });
+    exported.rules.max_transfer_amount = "not-a-number";
+
+    expect(() => configToRules(exported)).toThrow(/max_transfer_amount/);
+  });
+
+  it("rejects a non-string max_transfer_amount value (e.g. a number from JSON)", () => {
+    const exported = exportConfig(BASE_RULES, [], null, { label: "test", network: "testnet" });
+    (exported.rules as unknown as Record<string, unknown>).max_transfer_amount = 5_000_000;
+
+    expect(() => configToRules(exported)).toThrow(/max_transfer_amount/);
+  });
+
   it("configToTierPolicies restores bigint amounts", () => {
     const exported = exportConfig(
       BASE_RULES,
@@ -82,6 +96,77 @@ describe("exportConfig / configToRules round-trip", () => {
     expect(restored).toEqual([
       { fromTier: 0, toTier: 2, policy: { blocked: true, max_transfer_amount: 1000n, min_from_tier: 0, min_to_tier: 0 } },
     ]);
+  });
+
+  it("parseConfigJson rejects a malformed tierPolicies entry", () => {
+    const exported = exportConfig(BASE_RULES, [], null, { label: "test", network: "testnet" });
+    const json = JSON.stringify({
+      ...exported,
+      tierPolicies: [{ fromTier: 0, toTier: 2, policy: { blocked: "yes", max_transfer_amount: 1000 } }],
+    });
+    const result = parseConfigJson(json);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/tierPolicies\[0\]/);
+  });
+});
+
+describe("parseConfigJson — tierPolicies entry validation", () => {
+  const VALID_ENTRY = {
+    fromTier: 0,
+    toTier: 2,
+    policy: { blocked: false, max_transfer_amount: "1000", min_from_tier: 0, min_to_tier: 0 },
+  };
+
+  function jsonWithEntries(entries: unknown[]): string {
+    const exported = exportConfig(BASE_RULES, [], null, { label: "test", network: "testnet" });
+    return JSON.stringify({ ...exported, tierPolicies: entries });
+  }
+
+  it("accepts a well-formed tier policy entry", () => {
+    expect(parseConfigJson(jsonWithEntries([VALID_ENTRY])).ok).toBe(true);
+  });
+
+  it.each([
+    ["a non-object entry", "oops", /tierPolicies\[0\]: expected an object/],
+    ["a missing policy object", { fromTier: 0, toTier: 2 }, /tierPolicies\[0\]\.policy/],
+    ["a string fromTier", { ...VALID_ENTRY, fromTier: "0" }, /fromTier/],
+    ["a non-boolean blocked flag", { ...VALID_ENTRY, policy: { ...VALID_ENTRY.policy, blocked: "no" } }, /blocked/],
+    [
+      "a non-numeric max_transfer_amount",
+      { ...VALID_ENTRY, policy: { ...VALID_ENTRY.policy, max_transfer_amount: "lots" } },
+      /max_transfer_amount/,
+    ],
+    [
+      "a missing min_to_tier",
+      { ...VALID_ENTRY, policy: { blocked: false, max_transfer_amount: "1000", min_from_tier: 0 } },
+      /min_to_tier/,
+    ],
+  ])("rejects %s", (_label, entry, pattern) => {
+    const result = parseConfigJson(jsonWithEntries([entry]));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(pattern);
+  });
+});
+
+describe("parseConfigJson — empty rule sets", () => {
+  const json = (overrides: Record<string, unknown>) =>
+    JSON.stringify({
+      ...exportConfig(BASE_RULES, [], null, { label: "test", network: "testnet" }),
+      ...overrides,
+    });
+
+  it("rejects an empty tierPolicies array when a non-empty policy set is required", () => {
+    expect(parseConfigJson(json({}), { requireTierPolicies: true })).toEqual({
+      ok: false,
+      error: '"tierPolicies" must contain at least one policy.',
+    });
+    expect(parseConfigJson(json({})).ok).toBe(true);
+  });
+
+  it("rejects an empty riskConfig object", () => {
+    const result = parseConfigJson(json({ riskConfig: {} }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/riskConfig/);
   });
 });
 
@@ -169,5 +254,39 @@ describe("applyComplianceConfig", () => {
     const result = await applyComplianceConfig(config, ADMIN, signTx);
     expect(mockSetRiskConfig).not.toHaveBeenCalled();
     expect(result.riskConfigApplied).toBe(false);
+  });
+});
+
+describe("exportConfig validation", () => {
+  it("rejects blank network values", () => {
+    const config = exportConfig(BASE_RULES, [], null, { label: "test", network: "" });
+    expect(config.network).toBe("unknown");
+  });
+
+  it("rejects whitespace-only network values", () => {
+    const config = exportConfig(BASE_RULES, [], null, { label: "test", network: "   " });
+    expect(config.network).toBe("unknown");
+  });
+
+  it("rejects blank label values", () => {
+    const config = exportConfig(BASE_RULES, [], null, { label: "", network: "testnet" });
+    expect(config.label).toBe("Compliance config");
+  });
+
+  it("rejects whitespace-only label values", () => {
+    const config = exportConfig(BASE_RULES, [], null, { label: "   ", network: "testnet" });
+    expect(config.label).toBe("Compliance config");
+  });
+
+  it("preserves valid label and network values", () => {
+    const config = exportConfig(BASE_RULES, [], null, { label: "My Config", network: "mainnet" });
+    expect(config.label).toBe("My Config");
+    expect(config.network).toBe("mainnet");
+  });
+
+  it("trims leading/trailing whitespace from valid values", () => {
+    const config = exportConfig(BASE_RULES, [], null, { label: "  My Config  ", network: "  testnet  " });
+    expect(config.label).toBe("My Config");
+    expect(config.network).toBe("testnet");
   });
 });
